@@ -2,6 +2,10 @@ import sys
 
 
 def main():
+    if "--selftest" in sys.argv:
+        from app.selftest import run
+        run()
+        return
     from PySide6.QtWidgets import QApplication
 
     from app.gui.main_window import MainWindow

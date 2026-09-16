@@ -49,6 +49,18 @@ jobs:
           Get-Item $exe | Select-Object Name, Length
           Get-FileHash $exe -Algorithm SHA256 | Format-List
 
+      - name: Run packaged exe --selftest (proves onefile binary works)
+        shell: pwsh
+        run: |
+          # GUI-subsystem exe: launched via Start-Process, report goes to a log file
+          $log = Join-Path $env:RUNNER_TEMP "selftest.log"
+          if (Test-Path $log) { Remove-Item $log }
+          $exe = (Resolve-Path "dist/DiplomGenerator.exe").Path
+          $p = Start-Process -FilePath $exe -ArgumentList "--selftest","--selftest-log",$log -Wait -PassThru
+          Write-Output "selftest exit code: $($p.ExitCode)"
+          if (Test-Path $log) { Get-Content $log } else { Write-Output "NO LOG PRODUCED" }
+          if ($p.ExitCode -ne 0) { throw "packaged exe selftest failed" }
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
