@@ -1,0 +1,8 @@
+.venv/
+build/
+build_*/
+dist/
+dist_*/
+__pycache__/
+*.mapping.json
+testdata/
