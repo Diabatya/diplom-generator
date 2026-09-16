@@ -12,7 +12,7 @@ except ImportError:
 from PySide6.QtCore import QUrl, Qt
 from PySide6.QtGui import QDesktopServices, QImage, QPixmap
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
     QGroupBox, QHBoxLayout, QLabel, QMessageBox, QPlainTextEdit,
     QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
@@ -100,6 +100,9 @@ class StepExcel(QWidget):
         self.cmb_name = QComboBox()
         self.cmb_name.currentIndexChanged.connect(self._name_src_changed)
         name_row.addWidget(self.cmb_name)
+        self.chk_first_word = QCheckBox("Взять только первое слово")
+        self.chk_first_word.stateChanged.connect(self._first_word_changed)
+        name_row.addWidget(self.chk_first_word)
         self.lbl_name_preview = QLabel("")
         name_row.addWidget(self.lbl_name_preview, 1)
         root.addLayout(name_row)
@@ -232,7 +235,14 @@ class StepExcel(QWidget):
                 sel = self.cmb_name.count() - 1
         self.cmb_name.setCurrentIndex(sel)
         self.cmb_name.blockSignals(False)
+        self.chk_first_word.blockSignals(True)
+        self.chk_first_word.setChecked(self.state.filename_first_word)
+        self.chk_first_word.blockSignals(False)
         self._name_src_changed(sel)
+
+    def _first_word_changed(self, _state):
+        self.state.filename_first_word = self.chk_first_word.isChecked()
+        self._update_name_preview()
 
     def _name_src_changed(self, _idx: int):
         src = self.cmb_name.currentData()
@@ -256,6 +266,9 @@ class StepExcel(QWidget):
         col = self._filename_col()
         if self.state.rows and 0 <= col:
             raw = self.state.rows[0][col] if col < len(self.state.rows[0]) else ""
+            raw = raw.strip()
+            if self.state.filename_first_word and raw:
+                raw = raw.split()[0]
             ext = ".pptx" if self.state.template_type == "pptx" else ".pdf"
             self.lbl_name_preview.setText(f"Пример: {sanitize_filename(raw)}{ext}")
         else:
@@ -306,6 +319,7 @@ class StepExcel(QWidget):
                 self.state.template_path, self.state.template_type, self.state.fields,
                 self.state.colmap, [self.state.rows[idx]], tmpdir, MODE_SEPARATE,
                 self._filename_col(), set(),
+                first_word=self.state.filename_first_word,
             )
         except Exception as exc:
             QMessageBox.critical(self, "Пример", f"Ошибка генерации:\n{exc}")
@@ -333,6 +347,18 @@ class StepExcel(QWidget):
             QMessageBox.warning(self, "Excel", "Сначала выберите Excel-файл.")
             return
         self.state.filename_col = self._filename_col()
+        # persist naming choice into the template's .mapping.json
+        if self.state.template_path:
+            try:
+                from app.core import mapping_io
+                mapping_io.save_mapping(
+                    self.state.template_path, self.state.template_type,
+                    self.state.fields,
+                    filename_source=self.state.filename_source,
+                    filename_first_word=self.state.filename_first_word,
+                )
+            except Exception:
+                pass
         self._go_next()
 
     def on_enter(self):

@@ -200,7 +200,8 @@ class StepGenerate(QWidget):
         # collision check: files with the same names already in out_dir
         planned = planned_filenames(
             self.state.template_path, self.state.template_type,
-            self.state.rows, mode, self.state.filename_col, skip)
+            self.state.rows, mode, self.state.filename_col, skip,
+            first_word=self.state.filename_first_word)
         existing = [n for n in planned
                     if os.path.exists(os.path.join(self.state.out_dir, n))]
         exists_mode = EXISTS_OVERWRITE
@@ -227,6 +228,7 @@ class StepGenerate(QWidget):
             filename_col=self.state.filename_col,
             skip_rows=skip,
             exists_mode=exists_mode,
+            first_word=self.state.filename_first_word,
         )
         self._worker = _Worker(kwargs)
         self._worker.sig_progress.connect(self._on_progress)

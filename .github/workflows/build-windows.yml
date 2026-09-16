@@ -2,6 +2,7 @@ name: Build Windows exe
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -20,6 +21,19 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Environment info (proves real Windows build)
+        shell: pwsh
+        run: |
+          python --version
+          python -c "import platform; print('OS:', platform.platform())"
+          python -c "import os; print('WINDIR fonts:', os.path.isdir(os.path.join(os.environ.get('WINDIR','C:/Windows'),'Fonts')))"
+          python -c "from app.core.fonts import list_system_fonts, system_font_dirs; print('Font dirs:', system_font_dirs()); fs = list_system_fonts(cyrillic_only=True); print('Cyrillic-capable fonts found:', len(fs)); [print(' -', n, '->', p) for n, p in fs[:15]]"
+
+      - name: Generate test data and run headless tests
+        run: |
+          python make_test_data.py
+          python tests/headless_test.py
 
       - name: Build exe
         run: pyinstaller diplom.spec --noconfirm
@@ -40,14 +54,12 @@ jobs:
           retention-days: 90
 
       - name: Create / update release
+        if: github.ref_type == 'tag'
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $tag = "${{ github.ref_name }}"
-          if ("${{ github.ref_type }}" -ne "tag") {
-            $tag = "build-" + "${{ github.run_number }}"
-          }
           Write-Output "Release tag: $tag"
           gh release view $tag 2>$null
           if ($LASTEXITCODE -eq 0) {

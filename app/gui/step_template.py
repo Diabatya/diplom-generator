@@ -263,9 +263,13 @@ class StepTemplate(QWidget):
             )
             if ans == QMessageBox.Yes:
                 try:
-                    ttype, fields = mapping_io.load_mapping(path)
+                    ttype, fields, extra = mapping_io.load_mapping(path)
                     if ttype == self.state.template_type:
                         self.state.fields = fields
+                        if "filename_source" in extra:
+                            self.state.filename_source = tuple(extra["filename_source"])
+                        if "filename_first_word" in extra:
+                            self.state.filename_first_word = extra["filename_first_word"]
                     else:
                         QMessageBox.warning(self, "Разметка", "Тип шаблона в разметке не совпадает.")
                 except Exception as exc:
@@ -525,7 +529,9 @@ class StepTemplate(QWidget):
             return
         try:
             path = mapping_io.save_mapping(
-                self.state.template_path, self.state.template_type, self.state.fields
+                self.state.template_path, self.state.template_type, self.state.fields,
+                filename_source=self.state.filename_source,
+                filename_first_word=self.state.filename_first_word,
             )
             QMessageBox.information(self, "Разметка", f"Разметка сохранена:\n{path}")
         except Exception as exc:

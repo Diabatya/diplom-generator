@@ -21,5 +21,6 @@ class AppState:
 
     # ("field", field_name) or ("col", column_index) — what names output files
     filename_source: tuple = ("auto", None)
+    filename_first_word: bool = False
     out_dir: str | None = None
     filename_col: int = -1

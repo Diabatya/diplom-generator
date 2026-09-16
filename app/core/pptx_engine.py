@@ -10,6 +10,9 @@ from __future__ import annotations
 import copy
 import re
 
+from lxml import etree
+from pptx.oxml.ns import qn
+
 from pptx import Presentation
 from pptx.opc.constants import RELATIONSHIP_TYPE as RT
 from pptx.util import Emu, Pt
@@ -94,6 +97,119 @@ def _effective_size_pt(shape, run) -> float:
     return 18.0
 
 
+def _run_text(r_el) -> str:
+    t = r_el.find(qn("a:t"))
+    return t.text or ""
+
+
+def _set_run_text(r_el, s: str) -> None:
+    r_el.find(qn("a:t")).text = s
+
+
+def _clone_run(r_el, text: str):
+    nr = copy.deepcopy(r_el)
+    _set_run_text(nr, text)
+    return nr
+
+
+def _rpr_key(r_el) -> str:
+    rpr = r_el.find(qn("a:rPr"))
+    return etree.tostring(rpr) if rpr is not None else b""
+
+
+def _replace_in_paragraph(p_el, token: str, value: str):
+    """Replace the first ``token`` occurrence inside one ``a:p`` element,
+    splitting runs so surrounding text keeps its own formatting.
+
+    Returns (replaced, value_run_el, formats_differ).
+    """
+    runs = [el for el in p_el if el.tag == qn("a:r")]
+    if not runs:
+        return False, None, False
+    texts = [_run_text(r) for r in runs]
+    idx = "".join(texts).find(token)
+    if idx < 0:
+        return False, None, False
+    end = idx + len(token)
+
+    pos = 0
+    new_children = []
+    touched = []
+    value_run = None
+    for r, t in zip(runs, texts):
+        rs, re_ = pos, pos + len(t)
+        pos = re_
+        if re_ <= idx or rs >= end:
+            new_children.append(r)
+            continue
+        touched.append(r)
+        before = t[: idx - rs] if idx > rs else ""
+        after = t[end - rs:] if end < re_ else ""
+        if before:
+            new_children.append(_clone_run(r, before))
+        if value_run is None:
+            value_run = _clone_run(r, value)
+            new_children.append(value_run)
+        # text of later fully-covered runs is dropped (replaced by value)
+        if after:
+            new_children.append(_clone_run(r, after))
+
+    formats = {_rpr_key(r) for r in touched}
+    first_idx = list(p_el).index(runs[0])
+    for r in runs:
+        p_el.remove(r)
+    for i, el in enumerate(new_children):
+        p_el.insert(first_idx + i, el)
+    return True, value_run, len(formats) > 1
+
+
+def _replace_fragment(shape, token: str, value: str):
+    """Replace all ``token`` occurrences across paragraphs.
+
+    Returns (count, value_run_el, formats_differ).
+    """
+    count = 0
+    value_run = None
+    multi = False
+    for para in shape.text_frame.paragraphs:
+        for _ in range(50):
+            ok, vrun, diff = _replace_in_paragraph(para._p, token, value)
+            if not ok:
+                break
+            count += 1
+            multi = multi or diff
+            if value_run is None:
+                value_run = vrun
+    return count, value_run, multi
+
+
+def _run_font(r_el):
+    """(size_pt|None, family|None) from the run's rPr."""
+    rpr = r_el.find(qn("a:rPr"))
+    if rpr is None:
+        return None, None
+    sz = rpr.get("sz")
+    latin = rpr.find(qn("a:latin"))
+    return (int(sz) / 100.0 if sz else None,
+            latin.get("typeface") if latin is not None else None)
+
+
+def _set_run_size(r_el, pt: float) -> None:
+    rpr = r_el.find(qn("a:rPr"))
+    if rpr is None:
+        rpr = r_el.makeelement(qn("a:rPr"), {})
+        r_el.insert(0, rpr)
+    rpr.set("sz", str(int(round(pt * 100))))
+
+
+def _runs_elements(shape):
+    return [
+        (r, _run_text(r))
+        for para in shape.text_frame.paragraphs
+        for r in para._p.findall(qn("a:r"))
+    ]
+
+
 def _set_text_keep_format(shape, new_text: str):
     """Put ``new_text`` into the first run, clear the rest."""
     tf = shape.text_frame
@@ -126,15 +242,60 @@ def new_text_for(placement: PptxPlacement, value: str) -> str:
 
 
 def apply_field_to_slide(slide, placement: PptxPlacement, value: str):
-    """Replace placeholder text in one shape. Returns review note or None."""
+    """Replace placeholder text in one shape. Returns list of review notes."""
     shape = find_shape(slide, placement.shape_id)
     if shape is None or not shape.has_text_frame:
-        return "текстовый блок не найден"
-    new_text = new_text_for(placement, value)
-    run = _set_text_keep_format(shape, new_text)
+        return ["текстовый блок не найден"]
+
+    notes: list[str] = []
+    value_run_el = None   # a:r element holding the inserted value
+    fallback_run = None   # Run object for whole-text replacement
+
+    if placement.mode in ("fragment", "token") and placement.token:
+        cnt, value_run_el, multi = _replace_fragment(shape, placement.token, value)
+        if cnt == 0:
+            fallback_run = _set_text_keep_format(shape, value)
+            notes.append("токен не найден в тексте блока — заменён весь текст")
+        elif multi:
+            notes.append(
+                "форматирование фрагмента взято от первого run'а, проверьте вручную")
+    else:
+        new_text = new_text_for(placement, value)
+        fallback_run = _set_text_keep_format(shape, new_text)
+
     box_w = _shape_text_width_pt(shape)
     if box_w <= 0:
-        return None
+        return notes
+
+    if value_run_el is not None:
+        # fragment mode: shrink the value run until the composed line fits
+        infos = _runs_elements(shape)
+        others_w = 0.0
+        orig_size, fname = 18.0, None
+        for r_el, text in infos:
+            sz, name = _run_font(r_el)
+            fp = fontlib.find_font_file(name or "")
+            if r_el is value_run_el:
+                orig_size = sz or orig_size
+                fname = name
+            else:
+                others_w += fontlib.measure_text_width(text, fp, sz or 18.0)
+        font_path = fontlib.find_font_file(fname or "")
+        size = orig_size
+        min_size = max(4.0, size * fontlib.MIN_FONT_RATIO)
+        while size > min_size and others_w + fontlib.measure_text_width(
+                value, font_path, size) > box_w:
+            size -= 1.0 if size > 12 else 0.5
+        fits = others_w + fontlib.measure_text_width(value, font_path, size) <= box_w
+        if size < orig_size:
+            _set_run_size(value_run_el, size)
+            notes.append(f"шрифт уменьшен до {size:.1f} pt")
+        if not fits:
+            notes.append(f"текст не поместился даже при минимальном размере ({size:.1f} pt)")
+        return notes
+
+    run = fallback_run
+    new_text = shape.text_frame.text
     orig_size = _effective_size_pt(shape, run)
     font_path = fontlib.find_font_file(run.font.name or "")
     allow_wrap = bool(shape.text_frame.word_wrap)
@@ -144,10 +305,10 @@ def apply_field_to_slide(slide, placement: PptxPlacement, value: str):
     if new_size < orig_size:
         run.font.size = Pt(new_size)
     if not fits:
-        return f"текст не поместился даже при минимальном размере ({new_size:.1f} pt)"
-    if new_size < orig_size:
-        return f"шрифт уменьшен до {new_size:.1f} pt"
-    return None
+        notes.append(f"текст не поместился даже при минимальном размере ({new_size:.1f} pt)")
+    elif new_size < orig_size:
+        notes.append(f"шрифт уменьшен до {new_size:.1f} pt")
+    return notes
 
 
 def substitute(prs: Presentation, fields: list[Field], values: dict[str, str]):
@@ -166,8 +327,7 @@ def substitute(prs: Presentation, fields: list[Field], values: dict[str, str]):
             if pl.slide >= len(slides):
                 notes.append(f"{f.name}: слайд {pl.slide + 1} отсутствует")
                 continue
-            note = apply_field_to_slide(slides[pl.slide], pl, value)
-            if note:
+            for note in apply_field_to_slide(slides[pl.slide], pl, value):
                 notes.append(f"{f.name}: {note}")
     return notes
 
@@ -237,8 +397,7 @@ def render_combined(
                 if pl.slide >= len(slides):
                     notes.append(f"{f.name}: слайд {pl.slide + 1} отсутствует")
                     continue
-                note = apply_field_to_slide(slides[pl.slide], pl, value)
-                if note:
+                for note in apply_field_to_slide(slides[pl.slide], pl, value):
                     notes.append(f"{f.name}: {note}")
         notes_per_row.append(notes)
     prs.save(out_path)

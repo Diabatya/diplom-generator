@@ -18,7 +18,7 @@ MODE_COMBINED = "combined"
 
 EXISTS_OVERWRITE = "overwrite"   # перезаписать существующие
 EXISTS_SKIP = "skip"             # пропустить существующие
-EXISTS_SUFFIX = "suffix"         # добавить суффикс _new / _new2 / ...
+EXISTS_SUFFIX = "suffix"         # нумеровать свободные имена _2, _3, ...
 
 _INVALID = re.compile(r'[\\/:*?"<>|]')
 MAX_NAME_LEN = 80
@@ -63,9 +63,14 @@ def _combined_name(template_path: str, template_type: str) -> str:
     return sanitize_filename(stem) + "_combined" + _ext(template_type)
 
 
-def _base_name(row: list[str], filename_col: int, row_no: int) -> str:
-    if 0 <= filename_col < len(row) and row[filename_col].strip():
-        return row[filename_col]
+def _base_name(row: list[str], filename_col: int, row_no: int,
+               first_word: bool = False) -> str:
+    if 0 <= filename_col < len(row):
+        value = row[filename_col].strip()
+        if first_word and value:
+            value = value.split()[0]
+        if value:
+            return value
     return f"row_{row_no}"
 
 
@@ -76,6 +81,7 @@ def planned_filenames(
     mode: str,
     filename_col: int,
     skip_rows: set[int] | None = None,
+    first_word: bool = False,
 ) -> list[str]:
     """Basenames that a run will try to create — used by the UI to detect
     collisions with existing files before generation starts."""
@@ -88,7 +94,8 @@ def planned_filenames(
     for i, row in enumerate(rows):
         if i in skip_rows:
             continue
-        out.append(_next_name(counters, _base_name(row, filename_col, i + 2)) + _ext(template_type))
+        out.append(_next_name(
+            counters, _base_name(row, filename_col, i + 2, first_word)) + _ext(template_type))
     return out
 
 
@@ -109,11 +116,10 @@ def _resolve_collision(out_dir: str, name: str, ext: str, exists_mode: str):
         return _fit_path(out_dir, name, ext), False
     if exists_mode == EXISTS_SKIP:
         return None, True
-    # suffix: name_new.ext, name_new2.ext, ...
-    n = 0
+    # suffix: unified scheme — name.ext, name_2.ext, name_3.ext, ...
+    n = 2
     while True:
-        cand = f"{name}_new" if n == 0 else f"{name}_new{n + 1}"
-        fname = _fit_path(out_dir, cand, ext)
+        fname = _fit_path(out_dir, f"{name}_{n}", ext)
         if not os.path.exists(os.path.join(out_dir, fname)):
             return fname, False
         n += 1
@@ -130,6 +136,7 @@ def generate(
     filename_col: int,
     skip_rows: set[int] | None = None,
     exists_mode: str = EXISTS_OVERWRITE,
+    first_word: bool = False,
     progress_cb=None,
     cancel_cb=None,
 ) -> dict:
@@ -168,7 +175,7 @@ def generate(
         else:
             _generate_separate(
                 template_path, template_type, fields, colmap, rows,
-                out_dir, filename_col, skip_rows, exists_mode,
+                out_dir, filename_col, skip_rows, exists_mode, first_word,
                 progress, check_cancel, report,
             )
     except Cancelled:
@@ -187,7 +194,8 @@ def _next_name(counters: dict, base: str) -> str:
 
 def _generate_separate(
     template_path, template_type, fields, colmap, rows, out_dir,
-    filename_col, skip_rows, exists_mode, progress, check_cancel, report,
+    filename_col, skip_rows, exists_mode, first_word,
+    progress, check_cancel, report,
 ):
     counters: dict = {}
     ext = _ext(template_type)
@@ -198,7 +206,8 @@ def _generate_separate(
         if i in skip_rows:
             report["skipped"].append((row_no, "пропущена по решению пользователя"))
             continue
-        name = _next_name(counters, _base_name(row, filename_col, row_no))
+        name = _next_name(
+            counters, _base_name(row, filename_col, row_no, first_word))
         fname, skip = _resolve_collision(out_dir, name, ext, exists_mode)
         if skip:
             report["skipped"].append((row_no, "файл с таким именем уже существует — пропущен"))

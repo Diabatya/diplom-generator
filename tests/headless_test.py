@@ -199,15 +199,20 @@ def main():
     d.close()
 
     # ---- case 7: mapping save/load ----------------------------------------
-    path = mapping_io.save_mapping(T_PPTX, TEMPLATE_PPTX, fields)
+    path = mapping_io.save_mapping(T_PPTX, TEMPLATE_PPTX, fields,
+                                   filename_source=("field", "ФИО"),
+                                   filename_first_word=True)
     check("c7: mapping file written", os.path.isfile(path), path)
-    ttype, loaded = mapping_io.load_mapping(T_PPTX)
+    ttype, loaded, extra = mapping_io.load_mapping(T_PPTX)
     check("c7: mapping roundtrip",
           ttype == "pptx" and len(loaded) == 2
           and loaded[0].name == "ФИО" and len(loaded[0].placements) == 2)
+    check("c7: naming settings persisted",
+          extra.get("filename_source") == ("field", "ФИО")
+          and extra.get("filename_first_word") is True)
     # same for pdf
     mapping_io.save_mapping(T_PDF, TEMPLATE_PDF, pfields)
-    tt2, ld2 = mapping_io.load_mapping(T_PDF)
+    tt2, ld2, _ex2 = mapping_io.load_mapping(T_PDF)
     check("c7: pdf mapping roundtrip",
           tt2 == "pdf" and isinstance(ld2[0].placements[0], PdfPlacement)
           and ld2[0].placements[0].font_size == 36)
@@ -253,11 +258,11 @@ def main():
     rep_suf = generate(T_PPTX, TEMPLATE_PPTX, fields, cm, rows[:3], out_e,
                        MODE_SEPARATE, cm["ФИО"], set(), exists_mode=EXISTS_SUFFIX)
     names_suf = sorted(fn for _r, fn in rep_suf["created"])
-    check("exists: suffix _new", all("_new" in n for n in names_suf), str(names_suf))
+    check("exists: unified _2 suffix", all("_2." in n for n in names_suf), str(names_suf))
     rep_suf2 = generate(T_PPTX, TEMPLATE_PPTX, fields, cm, rows[:3], out_e,
                         MODE_SEPARATE, cm["ФИО"], set(), exists_mode=EXISTS_SUFFIX)
     names_suf2 = sorted(fn for _r, fn in rep_suf2["created"])
-    check("exists: suffix _new2", all("_new2" in n for n in names_suf2), str(names_suf2))
+    check("exists: unified _3 suffix", all("_3." in n for n in names_suf2), str(names_suf2))
     rep_over = generate(T_PPTX, TEMPLATE_PPTX, fields, cm, rows[:3], out_e,
                         MODE_SEPARATE, cm["ФИО"], set(), exists_mode=EXISTS_OVERWRITE)
     check("exists: overwrite creates 3", len(rep_over["created"]) == 3)
@@ -281,22 +286,24 @@ def main():
     check("namecol: dedup by chosen col",
           names_nd == ["Казань.pptx", "Казань_2.pptx", "Казань_3.pptx"], str(names_nd))
 
-    # ---- P1.1: fragment mode ------------------------------------------------
-    reg_sid = fields[1].placements[0].shape_id
+    # ---- P1.1: fragment mode (token is substring of the real block text) ----
+    fio2_sid = next(pl.shape_id for pl in fields[0].placements
+                    if pl.shape_id != fields[0].placements[0].shape_id)
     frag_fields = [
-        fields[0],
-        Field("Регион", [PptxPlacement(
-            0, reg_sid, pattern="Награждается житель региона РЕГИОН за победу",
-            token="РЕГИОН", mode="fragment")]),
+        Field("ФИО", [PptxPlacement(
+            0, fio2_sid, pattern="Выдан: @@FIO@@", token="@@FIO@@",
+            mode="fragment")]),
+        fields[1],
     ]
     out_f = os.path.join(tmp, "frag")
     rep_f = generate(T_PPTX, TEMPLATE_PPTX, frag_fields, cm, [rows[0]], out_f,
                      MODE_SEPARATE, cm["ФИО"], set())
     texts_f = pptx_texts(os.path.join(out_f, rep_f["created"][0][1]))
     check("fragment: surrounding text kept",
-          any("Награждается житель региона Москва за победу" in t for t in texts_f),
+          any("Выдан: Иванов Иван Иванович" in t for t in texts_f),
           str(texts_f))
     # back-compat: placement dict without "mode" behaves as whole
+    reg_sid = fields[1].placements[0].shape_id
     pl_old = PptxPlacement.from_dict(
         {"type": "pptx_shape", "slide": 0, "shape_id": reg_sid,
          "pattern": "Выдан: @@FIO@@", "token": "@@FIO@@"})
@@ -352,6 +359,79 @@ def main():
     out_img = next(s for s in prs_i.slides[1].shapes
                    if s.shape_type == MSO_SHAPE_TYPE.PICTURE).image.blob
     check("images: bytes identical", tpl_img == out_img)
+
+    # ---- P1: first-word filename -------------------------------------------
+    out_fw = os.path.join(tmp, "fw")
+    rep_fw = generate(T_PPTX, TEMPLATE_PPTX, fields, cm, rows[:5], out_fw,
+                      MODE_SEPARATE, cm["ФИО"], set(), first_word=True)
+    names_fw = sorted(fn for _r, fn in rep_fw["created"])
+    check("firstword: surname-only names",
+          names_fw == ["Иванов.pptx", "Иванов_2.pptx", "Кузнецова.pptx",
+                       "Петрова.pptx", "Сидоров.pptx"], str(names_fw))
+
+    # ---- P2: fragment formatting preserved ----------------------------------
+    from pptx.util import Cm, Pt
+    frag_pptx = os.path.join(tmp, "frag_tpl.pptx")
+    prs_f = Presentation()
+    prs_f.slide_width = Cm(29.7)
+    prs_f.slide_height = Cm(21)
+    sl = prs_f.slides.add_slide(prs_f.slide_layouts[6])
+    tb = sl.shapes.add_textbox(Cm(2), Cm(9), Cm(26), Cm(3))
+    p = tb.text_frame.paragraphs[0]
+    r1 = p.add_run(); r1.text = "Награждается "; r1.font.size = Pt(18)
+    r2 = p.add_run(); r2.text = "ФАМИЛИЯ"; r2.font.size = Pt(36); r2.font.bold = True
+    r3 = p.add_run(); r3.text = " за победу"; r3.font.size = Pt(18)
+    prs_f.save(frag_pptx)
+
+    fshape_id = next(s.shape_id for s in sl.shapes if s.has_text_frame)
+    frag_f = [Field("ФИО", [PptxPlacement(
+        0, fshape_id,
+        pattern="Награждается ФАМИЛИЯ за победу", token="ФАМИЛИЯ",
+        mode="fragment")])]
+    out_ff = os.path.join(tmp, "ff")
+    rep_ff = generate(frag_pptx, TEMPLATE_PPTX, frag_f, {"ФИО": 0},
+                      [["Иванов И.И."]], out_ff, MODE_SEPARATE, 0, set())
+    check("fragfmt: file created", len(rep_ff["created"]) == 1)
+    prs_out = Presentation(os.path.join(out_ff, rep_ff["created"][0][1]))
+    fshape = next(s for s in prs_out.slides[0].shapes if s.has_text_frame)
+    runs = [(r.text, r.font.size.pt if r.font.size else None, bool(r.font.bold))
+            for para in fshape.text_frame.paragraphs for r in para.runs]
+    check("fragfmt: composed text",
+          "".join(r[0] for r in runs) == "Награждается Иванов И.И. за победу",
+          str(runs))
+    check("fragfmt: value keeps big bold format",
+          any(r[0] == "Иванов И.И." and r[1] == 36 and r[2] for r in runs))
+    check("fragfmt: surrounding keeps 18pt",
+          any(r[0] == " за победу" and r[1] == 18 for r in runs)
+          and any(r[0] == "Награждается " and r[1] == 18 for r in runs))
+
+    # fragment spanning two differently-formatted runs -> flag in report
+    frag2 = os.path.join(tmp, "frag2_tpl.pptx")
+    prs_g = Presentation()
+    prs_g.slide_width = Cm(29.7); prs_g.slide_height = Cm(21)
+    sl2 = prs_g.slides.add_slide(prs_g.slide_layouts[6])
+    tb2 = sl2.shapes.add_textbox(Cm(2), Cm(9), Cm(26), Cm(3))
+    p2 = tb2.text_frame.paragraphs[0]
+    g1 = p2.add_run(); g1.text = "Выдано: "; g1.font.size = Pt(18)
+    g2 = p2.add_run(); g2.text = "ФА"; g2.font.size = Pt(36); g2.font.bold = True
+    g3 = p2.add_run(); g3.text = "МИЛИЯ"; g3.font.size = Pt(20)
+    g4 = p2.add_run(); g4.text = "."; g4.font.size = Pt(18)
+    prs_g.save(frag2)
+    gsid = next(s.shape_id for s in sl2.shapes if s.has_text_frame)
+    frag_g = [Field("ФИО", [PptxPlacement(
+        0, gsid, pattern="Выдано: ФАМИЛИЯ.", token="ФАМИЛИЯ", mode="fragment")])]
+    rep_fg = generate(frag2, TEMPLATE_PPTX, frag_g, {"ФИО": 0}, [["Иванов И.И."]],
+                      os.path.join(tmp, "fg"), MODE_SEPARATE, 0, set())
+    check("fragfmt: multi-format flagged",
+          any("первого run" in n for _r, notes in rep_fg["review"] for n in notes),
+          str(rep_fg["review"]))
+    prs_gout = Presentation(os.path.join(tmp, "fg", rep_fg["created"][0][1]))
+    gshape = next(s for s in prs_gout.slides[0].shapes if s.has_text_frame)
+    g_runs = [(r.text, r.font.size.pt if r.font.size else None)
+              for para in gshape.text_frame.paragraphs for r in para.runs]
+    check("fragfmt: multi-run value uses first format",
+          any(r[0] == "Иванов И.И." and r[1] == 36 for r in g_runs), str(g_runs))
+    check("fragfmt: tail kept", any(r[0] == "." and r[1] == 18 for r in g_runs))
 
     # ---- perf: 150 rows -------------------------------------------------------
     big_rows = [[f"{n} Тестович{i}", REGIONS[i % len(REGIONS)]]
