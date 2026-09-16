@@ -32,7 +32,7 @@
 
 | Пункт | Статус | Пояснение |
 |---|---|---|
-| **P0. Windows-сборка** | **не проверено — требует ручной проверки** | Сборка выполнялась на macOS (рабочий onefile-бинарь). PyInstaller не умеет кросс-компиляцию → реальный `.exe` надо собрать на Windows по инструкции в разделе 4 и проверить вручную. Платформо-зависимый код просмотрен и укреплён (ниже), но Windows-прогон не выполнен. |
+| **P0. Windows-сборка** | **собрано на Windows (GitHub Actions); запуск — проверить вручную** | `DiplomGenerator.exe` собран на `windows-latest` через GitHub Actions (`.github/workflows/build.yml`), выложен в релиз `v1.0.0` приватного репо `Diabatya/diplom-generator`. Файл проверен как PE32+ x86-64, ~78 МБ. Запуск на машине без Python физически не проверялся (нет Windows-хоста) — см. раздел 3. Лог сборки: Actions → run тега `v1.0.0` (там же SHA-256 файла). |
 | P0 — папки шрифтов на Windows | реализовано, на Windows не прогонялось | `fonts.system_font_dirs()` уже покрывает `%WINDIR%\Fonts` и `%LOCALAPPDATA%\Microsoft\Windows\Fonts`; macOS/Linux — свои наборы. |
 | P0 — резолв TTF по имени | реализовано | `find_font_file` знает имена файлов Windows-шрифтов (`arial.ttf`, `calibri.ttf`, `times.ttf`, `cour.ttf`…) + точное/подстроковое совпадение имени файла. Замер ширины идёт по самому TTF через `fitz.Font.text_length` — платформонезависимо. |
 | P0 — пути/кириллица/длинные пути | реализовано | Все пути через `os.path`/`pathlib`-совместимые вызовы, unicode-имена файлов работают (тесты генерируют файлы с русскими именами). Добавлена защита: итоговый полный путь ограничен 240 символами (`_fit_path`), имя усекается с учётом длины папки. |
@@ -79,9 +79,9 @@
 
 ## 3. Что нужно проверить руками
 
-- **Windows-сборка и запуск (P0, обязательно)**: собрать exe на Windows по
-  инструкции из раздела 4 и проверить на машине без Python. Отдельно
-  проверить на Windows:
+- **Запуск exe на Windows без Python (P0)**: файл собран на настоящем
+  Windows-раннере и выложен в релиз — осталось запустить его на чистой
+  Windows-машине и прогнать кейсы. Отдельно проверить на Windows:
   - открытие шаблона и Excel из папки с русскими буквами и пробелами в пути;
   - список шрифтов (должен показать Arial, Calibri, Times New Roman…);
   - автоподбор размера (поведение должно совпадать с macOS-прогоном);
@@ -100,19 +100,18 @@
 ## 4. Как проверить
 
 ### Сборка exe на Windows с нуля
-1. Установить Python 3.11+ с python.org (отметить «py launcher»).
-2. Скопировать папку проекта на Windows-машину.
-3. В папке проекта запустить `build.bat` — он создаст venv, поставит
-   зависимости и соберёт `dist\DiplomGenerator.exe`.
-   Вручную то же самое:
-   ```
-   py -3 -m venv .venv
-   .venv\Scripts\pip install -r requirements.txt
-   .venv\Scripts\pyinstaller diplom.spec --noconfirm
-   ```
-4. Перенести `dist\DiplomGenerator.exe` на машину без Python, запустить.
-   Проверить: открытие шаблона, привязку полей, загрузку Excel, пример,
-   генерацию, отчёт.
+**Готовый exe**: релиз `v1.0.0` в приватном репо
+`github.com/Diabatya/diplom-generator` → asset `DiplomGenerator.exe`
+(~78 МБ, PE32+ x86-64). Собран GitHub Actions на `windows-latest`.
+
+Пересборка: поставить тег `v*` и запушить — workflow соберёт exe и обновит
+релиз автоматически. Локально на Windows: `build.bat` →
+`dist\DiplomGenerator.exe` (или вручную: `py -3 -m venv .venv`,
+`.venv\Scripts\pip install -r requirements.txt`,
+`.venv\Scripts\pyinstaller diplom.spec --noconfirm`).
+
+После получения exe на машине без Python проверить: открытие шаблона,
+привязку полей, загрузку Excel, пример, генерацию, отчёт.
 
 ### Запуск из исходников
 `pip install -r requirements.txt` → `python run.py`.
