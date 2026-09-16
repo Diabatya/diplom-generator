@@ -437,25 +437,29 @@ def main():
     big_rows = [[f"{n} Тестович{i}", REGIONS[i % len(REGIONS)]]
                 for i, n in enumerate(NAMES * 15)]
     assert len(big_rows) == 150
-    import resource, time
+    import tracemalloc, time
+    tracemalloc.start()
     t0 = time.time()
-    mem0 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     rep_big = generate(T_PPTX, TEMPLATE_PPTX, fields, cm, big_rows,
                        os.path.join(tmp, "big"), MODE_SEPARATE, cm["ФИО"], set())
     t_pptx = time.time() - t0
-    mem1 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    _c, peak1 = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    tracemalloc.start()
     t0 = time.time()
     rep_big2 = generate(T_PDF, TEMPLATE_PDF, pfields, cm, big_rows,
                         os.path.join(tmp, "bigpdf"), MODE_SEPARATE, cm["ФИО"], set())
     t_pdf = time.time() - t0
-    mem2 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    _c, peak2 = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    mem_mb = max(peak1, peak2) / 1024 / 1024
     check("perf: 150 pptx", len(rep_big["created"]) == 150,
-          f"{t_pptx:.1f}s, maxrss {mem1/1024/1024:.0f} MB")
+          f"{t_pptx:.1f}s, peak {peak1/1024/1024:.0f} MB")
     check("perf: 150 pdf", len(rep_big2["created"]) == 150,
-          f"{t_pdf:.1f}s, maxrss {mem2/1024/1024:.0f} MB")
+          f"{t_pdf:.1f}s, peak {peak2/1024/1024:.0f} MB")
     PERF["pptx_150_s"] = round(t_pptx, 1)
     PERF["pdf_150_s"] = round(t_pdf, 1)
-    PERF["maxrss_mb"] = round(mem2 / 1024 / 1024)
+    PERF["peak_mem_mb"] = round(mem_mb)
 
     # ---- summary ------------------------------------------------------------
     ok = sum(1 for _n, c, _e in results if c)
