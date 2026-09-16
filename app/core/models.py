@@ -23,6 +23,7 @@ class PdfPlacement:
     font_size: float = 24.0
     color: str = "#000000"
     align: str = ALIGN_CENTER
+    fill_color: str = ""  # "" = auto (edge sampling); "#rrggbb" = manual
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -33,6 +34,7 @@ class PdfPlacement:
             "font_size": self.font_size,
             "color": self.color,
             "align": self.align,
+            "fill_color": self.fill_color,
         }
 
     @classmethod
@@ -44,6 +46,7 @@ class PdfPlacement:
             font_size=float(d.get("font_size", 24.0)),
             color=str(d.get("color", "#000000")),
             align=str(d.get("align", ALIGN_CENTER)),
+            fill_color=str(d.get("fill_color", "")),
         )
 
 

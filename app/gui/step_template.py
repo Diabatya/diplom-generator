@@ -19,7 +19,7 @@ from app.core.models import (
     ALIGN_CENTER, ALIGN_LEFT, ALIGN_RIGHT, Field, PdfPlacement,
     PptxPlacement, TEMPLATE_PDF, TEMPLATE_PPTX,
 )
-from app.gui.canvas import MODE_DRAW, MODE_PICK, PreviewCanvas
+from app.gui.canvas import MODE_DRAW, MODE_EYEDROP, MODE_PICK, PreviewCanvas
 from app.gui import pptx_render
 from app.gui.state import AppState
 
@@ -138,6 +138,7 @@ class StepTemplate(QWidget):
         self.canvas = PreviewCanvas()
         self.canvas.sigRectDrawn.connect(self._on_rect_drawn)
         self.canvas.sigShapePicked.connect(self._on_shape_picked)
+        self.canvas.sigPointClicked.connect(self._on_eyedrop)
         lv.addWidget(self.canvas, 1)
         split.addWidget(left)
 
@@ -202,11 +203,34 @@ class StepTemplate(QWidget):
         self._color = "#000000"
         self.btn_color.clicked.connect(self._pick_color)
         sv.addWidget(self.btn_color)
+        sv.addWidget(QLabel("Заливка фона под текстом:"))
+        frow = QHBoxLayout()
+        self.cmb_fill = QComboBox()
+        self.cmb_fill.addItem("Авто (подбор по краям рамки)", "")
+        self.cmb_fill.addItem("Свой цвет", "custom")
+        frow.addWidget(self.cmb_fill, 1)
+        self._fill_color = "#FFFFFF"
+        self.btn_fill_color = QPushButton("Цвет…")
+        self.btn_fill_color.clicked.connect(self._pick_fill_color)
+        self.btn_fill_pick = QPushButton("Пипетка")
+        self.btn_fill_pick.setToolTip(
+            "Кликните по превью, чтобы взять цвет плашки под текстом")
+        self.btn_fill_pick.clicked.connect(self._start_eyedrop)
+        frow.addWidget(self.btn_fill_color)
+        frow.addWidget(self.btn_fill_pick)
+        sv.addLayout(frow)
+        self.lbl_fill_warn = QLabel("")
+        self.lbl_fill_warn.setWordWrap(True)
+        self.lbl_fill_warn.setStyleSheet("color: #B26A00")
+        self.lbl_fill_warn.setVisible(False)
+        sv.addWidget(self.lbl_fill_warn)
         self.grp_style.setVisible(False)
         rv.addWidget(self.grp_style)
         self.cmb_font.currentIndexChanged.connect(self._style_changed)
         self.cmb_align.currentIndexChanged.connect(self._style_changed)
         self.spin_size.valueChanged.connect(self._style_changed)
+        self.cmb_fill.currentIndexChanged.connect(self._fill_mode_changed)
+        self._fill_mode_changed(0)
 
         self.btn_save_map = QPushButton("Сохранить разметку (.mapping.json)")
         self.btn_save_map.clicked.connect(self._save_mapping)
@@ -442,10 +466,13 @@ class StepTemplate(QWidget):
             font_size=self.spin_size.value(),
             color=self._color,
             align=self.cmb_align.currentData(),
+            fill_color=self._current_fill(),
         )
         f.placements.append(pl)
         self._refresh_fields_keep_sel()
         self._refresh_overlays()
+        self.lst_places.setCurrentRow(len(f.placements) - 1)
+        self._update_fill_warn(pl)
 
     def _del_place(self):
         f = self._cur_field()
@@ -495,7 +522,13 @@ class StepTemplate(QWidget):
             self._color = pl.color
             self.cmb_align.setCurrentIndex(
                 max(0, self.cmb_align.findData(pl.align)))
+            if pl.fill_color:
+                self._fill_color = pl.fill_color
+                self.cmb_fill.setCurrentIndex(1)
+            else:
+                self.cmb_fill.setCurrentIndex(0)
             self._loading_style = False
+            self._update_fill_warn(pl)
 
     def _style_changed(self, *_a):
         if self._loading_style:
@@ -509,6 +542,8 @@ class StepTemplate(QWidget):
                 pl.font_size = self.spin_size.value()
                 pl.color = self._color
                 pl.align = self.cmb_align.currentData()
+                pl.fill_color = self._current_fill()
+                self._update_fill_warn(pl)
         self._refresh_overlays()
 
     def _pick_custom_font(self):
@@ -522,6 +557,57 @@ class StepTemplate(QWidget):
         if c.isValid():
             self._color = c.name()
             self._style_changed()
+
+    # ---- PDF background fill -------------------------------------------
+    def _current_fill(self) -> str:
+        return self._fill_color if self.cmb_fill.currentIndex() == 1 else ""
+
+    def _fill_mode_changed(self, idx):
+        custom = idx == 1
+        self.btn_fill_color.setEnabled(custom)
+        self.btn_fill_pick.setEnabled(custom)
+        self._style_changed()
+
+    def _pick_fill_color(self):
+        c = QColorDialog.getColor(
+            QColor(self._fill_color), self, "Цвет заливки фона")
+        if c.isValid():
+            self._fill_color = c.name()
+            self._style_changed()
+
+    def _start_eyedrop(self):
+        if self.state.template_type == TEMPLATE_PDF:
+            self.canvas.set_mode(MODE_EYEDROP)
+
+    def _on_eyedrop(self, x: float, y: float):
+        self.canvas.set_mode(MODE_DRAW)
+        pix = self.canvas._pix
+        if pix is None or self._doc_w <= 0:
+            return
+        img = pix.toImage()
+        sx = img.width() / self._doc_w
+        px, py = int(x * sx), int(y * (img.height() / self._doc_h))
+        if 0 <= px < img.width() and 0 <= py < img.height():
+            self._fill_color = img.pixelColor(px, py).name()
+            self.cmb_fill.setCurrentIndex(1)
+            self._style_changed()
+
+    def _update_fill_warn(self, pl: PdfPlacement):
+        """Warn when the auto fill would likely punch a hole into a
+        coloured plate (edges much lighter than the interior)."""
+        warn = (
+            not pl.fill_color
+            and self.state.template_type == TEMPLATE_PDF
+            and self.state.template_path
+            and pdf_engine.fill_risk_at(
+                self.state.template_path, pl.page, pl.rect)
+        )
+        self.lbl_fill_warn.setText(
+            "Края рамки заметно светлее фона под текстом — возможно, рамка "
+            "захватывает фон за пределами цветной плашки и заливка оставит "
+            "светлое пятно. Задайте цвет заливки вручную (пипеткой по плашке)."
+            if warn else "")
+        self.lbl_fill_warn.setVisible(bool(warn))
 
     # ---- save / next --------------------------------------------------------
     def _save_mapping(self):

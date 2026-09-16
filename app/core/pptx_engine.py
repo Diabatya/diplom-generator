@@ -23,15 +23,19 @@ from .models import Field, PptxPlacement
 EMU_PER_PT = 12700.0
 _REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 
-_TOKEN_RE = re.compile(
-    r"(@+[^@\n]*@+|\{+[^{}\n]*\}+|<[^<>\n]*>|_+[^_\n]*_+|%+[^%\n]*%+|\[+[^\[\]\n]*\]+)"
-)
+_TOKEN_RE = re.compile(r"(@{2,}[^@\n]+@{2,})")
 
 
 def detect_token(text: str) -> str:
-    """Find a placeholder token like ``@@FIO@@`` inside shape text."""
+    """Find an explicit ``@@TOKEN@@`` placeholder inside shape text.
+
+    Only double-@ markers are auto-detected: other bracketed text
+    (``<номер>``, ``[название]``, ``_x_``) is ordinary text too often to
+    guess safely. Those can still be bound via fragment mode.
+    Returns "" when nothing is found.
+    """
     m = _TOKEN_RE.search(text)
-    return m.group(0) if m else text
+    return m.group(0) if m else ""
 
 
 def open_template(path: str) -> Presentation:
@@ -166,10 +170,10 @@ def _replace_in_paragraph(p_el, token: str, value: str):
 def _replace_fragment(shape, token: str, value: str):
     """Replace all ``token`` occurrences across paragraphs.
 
-    Returns (count, value_run_el, formats_differ).
+    Returns (count, [value_run_el, ...], formats_differ).
     """
     count = 0
-    value_run = None
+    value_runs: list = []
     multi = False
     for para in shape.text_frame.paragraphs:
         for _ in range(50):
@@ -178,9 +182,9 @@ def _replace_fragment(shape, token: str, value: str):
                 break
             count += 1
             multi = multi or diff
-            if value_run is None:
-                value_run = vrun
-    return count, value_run, multi
+            if vrun is not None:
+                value_runs.append(vrun)
+    return count, value_runs, multi
 
 
 def _run_font(r_el):
@@ -248,11 +252,11 @@ def apply_field_to_slide(slide, placement: PptxPlacement, value: str):
         return ["текстовый блок не найден"]
 
     notes: list[str] = []
-    value_run_el = None   # a:r element holding the inserted value
-    fallback_run = None   # Run object for whole-text replacement
+    value_run_els: list = []   # a:r elements holding the inserted value
+    fallback_run = None        # Run object for whole-text replacement
 
     if placement.mode in ("fragment", "token") and placement.token:
-        cnt, value_run_el, multi = _replace_fragment(shape, placement.token, value)
+        cnt, value_run_els, multi = _replace_fragment(shape, placement.token, value)
         if cnt == 0:
             fallback_run = _set_text_keep_format(shape, value)
             notes.append("токен не найден в тексте блока — заменён весь текст")
@@ -267,18 +271,22 @@ def apply_field_to_slide(slide, placement: PptxPlacement, value: str):
     if box_w <= 0:
         return notes
 
-    if value_run_el is not None:
-        # fragment mode: shrink the value run until the composed line fits
+    if value_run_els:
+        # fragment mode: shrink the value run until the composed line fits.
+        # Other value runs (the same token repeated in the block) are fully
+        # replaced text — they must not count towards "surrounding" width.
+        value_ids = {id(r) for r in value_run_els}
         infos = _runs_elements(shape)
         others_w = 0.0
         orig_size, fname = 18.0, None
         for r_el, text in infos:
             sz, name = _run_font(r_el)
-            fp = fontlib.find_font_file(name or "")
-            if r_el is value_run_el:
-                orig_size = sz or orig_size
-                fname = name
+            if id(r_el) in value_ids:
+                if r_el is value_run_els[0]:
+                    orig_size = sz or orig_size
+                    fname = name
             else:
+                fp = fontlib.find_font_file(name or "")
                 others_w += fontlib.measure_text_width(text, fp, sz or 18.0)
         font_path = fontlib.find_font_file(fname or "")
         size = orig_size
@@ -288,7 +296,8 @@ def apply_field_to_slide(slide, placement: PptxPlacement, value: str):
             size -= 1.0 if size > 12 else 0.5
         fits = others_w + fontlib.measure_text_width(value, font_path, size) <= box_w
         if size < orig_size:
-            _set_run_size(value_run_el, size)
+            for r_el in value_run_els:
+                _set_run_size(r_el, size)
             notes.append(f"шрифт уменьшен до {size:.1f} pt")
         if not fits:
             notes.append(f"текст не поместился даже при минимальном размере ({size:.1f} pt)")

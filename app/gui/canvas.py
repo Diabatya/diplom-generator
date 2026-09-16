@@ -8,8 +8,9 @@ from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QWidget
 
 MODE_NONE = "none"
-MODE_DRAW = "draw"   # PDF: drag to draw a rect
-MODE_PICK = "pick"   # PPTX: click a text block
+MODE_DRAW = "draw"      # PDF: drag to draw a rect
+MODE_PICK = "pick"      # PPTX: click a text block
+MODE_EYEDROP = "eyedrop"  # click to pick the pixel colour under the cursor
 
 _COLOR_SEL = QColor(30, 144, 255)      # placements of selected field
 _COLOR_OTHER = QColor(120, 120, 120)   # other placements
@@ -20,6 +21,7 @@ _COLOR_HOVER = QColor(60, 180, 75)
 class PreviewCanvas(QWidget):
     sigRectDrawn = Signal(float, float, float, float)  # doc coords (pt)
     sigShapePicked = Signal(int)                       # pptx shape_id
+    sigPointClicked = Signal(float, float)             # doc coords (pt), eyedrop
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -53,6 +55,8 @@ class PreviewCanvas(QWidget):
 
     def set_mode(self, mode: str):
         self._mode = mode
+        self.setCursor(Qt.CrossCursor if mode == MODE_EYEDROP
+                       else Qt.ArrowCursor)
         self.update()
 
     def set_pickable_shapes(self, shapes: list[dict]):
@@ -144,7 +148,10 @@ class PreviewCanvas(QWidget):
     def mousePressEvent(self, ev):
         if self._pix is None:
             return
-        if self._mode == MODE_DRAW and ev.button() == Qt.LeftButton:
+        if self._mode == MODE_EYEDROP and ev.button() == Qt.LeftButton:
+            x, y = self._to_doc(ev.position())
+            self.sigPointClicked.emit(x, y)
+        elif self._mode == MODE_DRAW and ev.button() == Qt.LeftButton:
             self._drag_start = ev.position()
             self._drag_cur = ev.position()
             self.update()

@@ -433,6 +433,132 @@ def main():
           any(r[0] == "Иванов И.И." and r[1] == 36 for r in g_runs), str(g_runs))
     check("fragfmt: tail kept", any(r[0] == "." and r[1] == 18 for r in g_runs))
 
+    # ===================== fifth-iteration cases ==========================
+
+    # ---- P0: PDF fill — coloured plate under a too-wide rect ---------------
+    plate_pdf = os.path.join(tmp, "plate.pdf")
+    font_path = find_font_file("Arial") or find_font_file("DejaVu Sans")
+    d = fitz.open()
+    pg = d.new_page(width=842, height=595)
+    GOLD = (0.8, 0.65, 0.1)
+    pg.draw_rect(fitz.Rect(200, 100, 650, 180), color=None, fill=GOLD)
+    pg.insert_text(fitz.Point(240, 150), "FAMILIYA", fontsize=28,
+                   color=(1, 1, 1))
+    d.save(plate_pdf)
+    d.close()
+    d = fitz.open(plate_pdf)
+    trect = d[0].search_for("FAMILIYA")[0]
+    d.close()
+    # rect spills past the plate (plate y 100..180) -> edge samples hit white
+    wide = (trect.x0 - 30, 80.0, trect.x1 + 30, 195.0)
+
+    def white_hole(pdf_path):
+        dd = fitz.open(pdf_path)
+        pix = dd[0].get_pixmap(dpi=72)
+        whites = 0
+        # strip inside the plate (y=105) and inside the redacted rect,
+        # left of where the text sits
+        for x in range(210, 260):
+            r, g, b = pix.pixel(x, 105)[:3]
+            if r > 240 and g > 240 and b > 240:
+                whites += 1
+        dd.close()
+        return whites
+
+    pl_auto = [Field("ФИО", [PdfPlacement(0, wide, font_path or "", 28,
+                                          "#FFFFFF", "left")])]
+    rep_pa = generate(plate_pdf, TEMPLATE_PDF, pl_auto, {"ФИО": 0},
+                      [["IVANOV"]], os.path.join(tmp, "pa"),
+                      MODE_SEPARATE, 0, set())
+    check("fillrisk: auto warns about wide rect",
+          any("края рамки светлее" in n
+              for _r, notes in rep_pa["review"] for n in notes),
+          str(rep_pa["review"]))
+    auto_out = os.path.join(tmp, "pa", rep_pa["created"][0][1])
+    check("fillrisk: auto leaves white hole (defect documented)",
+          white_hole(auto_out) > 10, str(white_hole(auto_out)))
+
+    pl_man = [Field("ФИО", [PdfPlacement(0, wide, font_path or "", 28,
+                                         "#FFFFFF", "left",
+                                         fill_color="#CCA61A")])]
+    rep_pm = generate(plate_pdf, TEMPLATE_PDF, pl_man, {"ФИО": 0},
+                      [["IVANOV"]], os.path.join(tmp, "pm"),
+                      MODE_SEPARATE, 0, set())
+    man_out = os.path.join(tmp, "pm", rep_pm["created"][0][1])
+    check("fillrisk: manual colour leaves no white hole",
+          white_hole(man_out) == 0, str(white_hole(man_out)))
+    check("fillrisk: no warn when colour is manual",
+          not any("края рамки" in n
+                  for _r, notes in rep_pm["review"] for n in notes))
+    # fill_color survives mapping roundtrip
+    mapping_io.save_mapping(plate_pdf, TEMPLATE_PDF, pl_man)
+    _tt, ld_plate, _e = mapping_io.load_mapping(plate_pdf)
+    check("fillrisk: fill_color persisted",
+          ld_plate[0].placements[0].fill_color == "#CCA61A")
+    # old mapping without fill_color -> auto
+    pl_nofill = PdfPlacement.from_dict(
+        {"type": "pdf_rect", "page": 0, "rect": [0, 0, 10, 10]})
+    check("fillrisk: missing fill_color -> auto", pl_nofill.fill_color == "")
+
+    # ---- P2: detect_token only sees @@...@@ --------------------------------
+    check("token: <...> not detected",
+          pptx_engine.detect_token("Диплом № <номер> выдан") == "")
+    check("token: [...] not detected",
+          pptx_engine.detect_token("Секция [название] победитель") == "")
+    check("token: _..._ not detected",
+          pptx_engine.detect_token("100%_результат_") == "")
+    check("token: @@...@@ detected",
+          pptx_engine.detect_token("Выдан: @@FIO@@") == "@@FIO@@")
+
+    # ---- P2: token twice in one block does not skew autofit -----------------
+    dup_pptx = os.path.join(tmp, "dup_tok.pptx")
+    prs_d = Presentation()
+    prs_d.slide_width = Cm(29.7)
+    prs_d.slide_height = Cm(21)
+    sld = prs_d.slides.add_slide(prs_d.slide_layouts[6])
+    tbA = sld.shapes.add_textbox(Cm(2), Cm(5), Cm(8), Cm(3))
+    ra = tbA.text_frame.paragraphs[0].add_run()
+    ra.text = "№ @@FIO@@"
+    ra.font.size = Pt(36)
+    tbB = sld.shapes.add_textbox(Cm(2), Cm(10), Cm(8), Cm(3))
+    rb = tbB.text_frame.paragraphs[0].add_run()
+    rb.text = "№ @@FIO@@ + @@FIO@@"
+    rb.font.size = Pt(36)
+    tbC = sld.shapes.add_textbox(Cm(2), Cm(15), Cm(8), Cm(3))
+    rc = tbC.text_frame.paragraphs[0].add_run()
+    rc.text = "№ @@FIO@@ + "   # same literal text, token only once
+    rc.font.size = Pt(36)
+    prs_d.save(dup_pptx)
+
+    sidB, sidC = tbB.shape_id, tbC.shape_id
+    val = "Иванов И.И."
+    fldB = [Field("ФИО", [PptxPlacement(0, sidB, pattern="№ @@FIO@@ + @@FIO@@",
+                                      token="@@FIO@@", mode="fragment")])]
+    fldC = [Field("ФИО", [PptxPlacement(0, sidC, pattern="№ @@FIO@@ + ",
+                                      token="@@FIO@@", mode="fragment")])]
+    rep_db = generate(dup_pptx, TEMPLATE_PPTX, fldB, {"ФИО": 0}, [[val]],
+                      os.path.join(tmp, "db"), MODE_SEPARATE, 0, set())
+    rep_dc = generate(dup_pptx, TEMPLATE_PPTX, fldC, {"ФИО": 0}, [[val]],
+                      os.path.join(tmp, "dc"), MODE_SEPARATE, 0, set())
+
+    def value_sizes(path):
+        prs = Presentation(path)
+        out = []
+        for s in prs.slides[0].shapes:
+            if s.has_text_frame:
+                for pa in s.text_frame.paragraphs:
+                    for r in pa.runs:
+                        if r.text == val:
+                            out.append(r.font.size.pt)
+        return out
+
+    szB = value_sizes(os.path.join(tmp, "db", rep_db["created"][0][1]))
+    szC = value_sizes(os.path.join(tmp, "dc", rep_dc["created"][0][1]))
+    check("duptok: both occurrences replaced", len(szB) == 2, str(szB))
+    check("duptok: repeated token does not skew autofit",
+          szB and szC and all(abs(s - szC[0]) < 0.01 for s in szB),
+          f"double={szB} single={szC}")
+
     # ---- perf: 150 rows -------------------------------------------------------
     big_rows = [[f"{n} Тестович{i}", REGIONS[i % len(REGIONS)]]
                 for i, n in enumerate(NAMES * 15)]

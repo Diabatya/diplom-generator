@@ -56,14 +56,34 @@ def system_font_dirs() -> list[str]:
     return [d for d in dirs if d and os.path.isdir(d)]
 
 
-def _iter_font_files() -> list[str]:
+@lru_cache(maxsize=1)
+def _font_files() -> tuple[str, ...]:
+    """All system font files, scanned once (Windows font dirs are huge —
+    rescanning per find_font_file call was a measurable slowdown)."""
     out = []
     for d in system_font_dirs():
         for root, _sub, files in os.walk(d):
             for fn in files:
                 if fn.lower().endswith(FONT_EXTS):
                     out.append(os.path.join(root, fn))
-    return sorted(set(out))
+    return tuple(sorted(set(out)))
+
+
+def _iter_font_files() -> list[str]:
+    return list(_font_files())
+
+
+@lru_cache(maxsize=1)
+def _stem_map() -> dict[str, str]:
+    return {os.path.splitext(os.path.basename(p))[0].lower(): p
+            for p in _font_files()}
+
+
+def font_cache_clear() -> None:
+    """Rescan fonts (e.g. after the user installs a font mid-session)."""
+    _font_files.cache_clear()
+    _stem_map.cache_clear()
+    _font_obj.cache_clear()
 
 
 def get_font(font_path: str | None) -> fitz.Font | None:
@@ -113,8 +133,8 @@ def find_font_file(font_name: str) -> str | None:
     if os.path.isfile(font_name):
         return font_name
     key = font_name.strip().lower()
-    files = _iter_font_files()
-    stems = {os.path.splitext(os.path.basename(p))[0].lower(): p for p in files}
+    files = _font_files()
+    stems = _stem_map()
     for cand in _KNOWN_FILES.get(key, []):
         stem = os.path.splitext(cand)[0].lower()
         if stem in stems:
