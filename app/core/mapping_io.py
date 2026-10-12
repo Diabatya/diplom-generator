@@ -25,6 +25,7 @@ def save_mapping(
     fields: list[Field],
     filename_source: tuple | None = None,
     filename_first_word: bool | None = None,
+    slide_sel: list[int] | None = None,
 ) -> str:
     path = mapping_path_for(template_path)
     data = {
@@ -37,6 +38,8 @@ def save_mapping(
         data["filename_source"] = list(filename_source)
     if filename_first_word is not None:
         data["filename_first_word"] = bool(filename_first_word)
+    if slide_sel is not None:
+        data["slide_sel"] = slide_sel
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(data, fh, ensure_ascii=False, indent=2)
     return path
@@ -61,4 +64,6 @@ def load_mapping(template_path: str) -> tuple[str, list[Field], dict]:
         extra["filename_source"] = (src[0], src[1])
     if "filename_first_word" in data:
         extra["filename_first_word"] = bool(data["filename_first_word"])
+    if isinstance(data.get("slide_sel"), list):
+        extra["slide_sel"] = [int(i) for i in data["slide_sel"]]
     return ttype, fields, extra

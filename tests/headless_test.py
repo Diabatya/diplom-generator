@@ -559,6 +559,205 @@ def main():
           szB and szC and all(abs(s - szC[0]) < 0.01 for s in szB),
           f"double={szB} single={szC}")
 
+    from app.core.generator import MAX_PATH_LEN, plan_batch_names, row_values
+    from pptx.dml.color import RGBColor
+    from unittest.mock import patch
+
+    names = plan_batch_names(["Иванов", "Иванов", "Иванов_2", "A", "a", "CON", "con.",
+                              "a/b", "a:b"], tmp, ".pptx", EXISTS_OVERWRITE)
+    actual = [n for n, _ in names]
+    check("iter6: unique casefold names and reserved devices",
+          len(actual) == len(set(n.casefold() for n in actual)) == 9
+          and actual[0:3] == ["Иванов.pptx", "Иванов_2.pptx", "Иванов_2_2.pptx"]
+          and all(os.path.splitext(n)[0].casefold() not in ("con", "nul", "prn")
+                  for n in actual), str(actual))
+    deep = os.path.join(tmp, "д" * max(1, MAX_PATH_LEN - len(tmp) - 85))
+    long_names = [n for n, _ in plan_batch_names(["Ж" * 80] * 3, deep, ".pptx", EXISTS_OVERWRITE)]
+    check("iter6: suffixes survive truncation", len(set(long_names)) == 3
+          and long_names[1].endswith("_2.pptx") and long_names[2].endswith("_3.pptx")
+          and all(len(os.path.join(deep, n)) <= MAX_PATH_LEN for n in long_names), str(long_names))
+    impossible = plan_batch_names(["file"], "/" + "a" * MAX_PATH_LEN, ".pptx", EXISTS_SUFFIX)
+    check("iter6: impossible path diagnosed", impossible[0][0] is None and bool(impossible[0][1]))
+
+    decorated = os.path.join(tmp, "decorated.pptx")
+    deck = Presentation()
+    deck.slide_width = Cm(28)
+    deck.slide_height = Cm(20)
+    d0 = deck.slides.add_slide(deck.slide_layouts[6])
+    d0.background.fill.solid()
+    d0.background.fill.fore_color.rgb = RGBColor(12, 34, 56)
+    n0 = d0.shapes.add_textbox(Cm(2), Cm(4), Cm(10), Cm(2))
+    n0.text = "@@FIO@@"
+    d1 = deck.slides.add_slide(deck.slide_layouts[6])
+    d1.background.fill.solid()
+    d1.background.fill.fore_color.rgb = RGBColor(48, 65, 82)
+    n1 = d1.shapes.add_textbox(Cm(2), Cm(4), Cm(10), Cm(2))
+    n1.text = "@@FIO@@"
+    deck.save(decorated)
+    both = [Field("ФИО", [PptxPlacement(i, b.shape_id, token="@@FIO@@", mode="token")
+                          for i, b in enumerate([n0, n1])])]
+    dr = generate(decorated, TEMPLATE_PPTX, both, {"ФИО": 0}, [["Первый"], ["Второй"]],
+                  os.path.join(tmp, "deck"), MODE_COMBINED, 0)
+    result = Presentation(os.path.join(tmp, "deck", dr["created"][0][1]))
+    names_order = [next(s.text_frame.text for s in sl.shapes if s.has_text_frame)
+                   for sl in result.slides]
+    colors = [str(sl.background.fill.fore_color.rgb) for sl in result.slides]
+    check("iter6: deck grouped by row", names_order == ["Первый", "Первый", "Второй", "Второй"], str(names_order))
+    check("iter6: solid slide-level backgrounds copied",
+          colors == ["0C2238", "304152", "0C2238", "304152"], str(colors))
+    one = generate(decorated, TEMPLATE_PPTX, both, {"ФИО": 0}, [["Первый"], ["Второй"]],
+                   os.path.join(tmp, "deck_one"), MODE_COMBINED, 0, slide_sel=[1])
+    selected = Presentation(os.path.join(tmp, "deck_one", one["created"][0][1]))
+    check("iter6: selected slide only", len(selected.slides) == 2 and
+          [str(sl.background.fill.fore_color.rgb) for sl in selected.slides] == ["304152"] * 2)
+    from pptx.oxml.xmlchemy import OxmlElement
+    from pptx.oxml.ns import qn
+    from pptx.opc.constants import RELATIONSHIP_TYPE as RT
+    styled = Presentation(decorated)
+    p_bg = styled.slides[0].element.find(qn("p:cSld")).find(qn("p:bg"))
+    p_bg.remove(p_bg[0])
+    grad = OxmlElement("p:bgPr")
+    grad_fill = OxmlElement("a:gradFill")
+    grad_stops = OxmlElement("a:gsLst")
+    for pos, hexcolor in (("0", "0C2238"), ("100000", "FFFFFF")):
+        stop = OxmlElement("a:gs")
+        stop.set("pos", pos)
+        color = OxmlElement("a:srgbClr")
+        color.set("val", hexcolor)
+        stop.append(color)
+        grad_stops.append(stop)
+    grad_fill.append(grad_stops)
+    grad.append(grad_fill)
+    p_bg.append(grad)
+    pic = next(s for s in Presentation(T_PPTX).slides[0].shapes
+               if s.shape_type == MSO_SHAPE_TYPE.PICTURE)
+    pic_part = pic.part.rels[pic._element.blip_rId].target_part
+    image_slide = styled.slides[1]
+    image_bg = image_slide.element.find(qn("p:cSld")).find(qn("p:bg"))
+    image_bg.remove(image_bg[0])
+    image_pr = OxmlElement("p:bgPr")
+    blip_fill = OxmlElement("a:blipFill")
+    blip = OxmlElement("a:blip")
+    blip.set(qn("r:embed"), image_slide.part.rels.get_or_add(RT.IMAGE, pic_part))
+    blip_fill.append(blip)
+    image_pr.append(blip_fill)
+    image_bg.append(image_pr)
+    styled_file = os.path.join(tmp, "backgrounds.pptx")
+    styled.save(styled_file)
+    styled_rep = generate(styled_file, TEMPLATE_PPTX, both, {"ФИО": 0},
+                          [["Первый"], ["Второй"]], os.path.join(tmp, "backgrounds"), MODE_COMBINED, 0)
+    reopened = Presentation(os.path.join(tmp, "backgrounds", styled_rep["created"][0][1]))
+    bg_first = reopened.slides[0].element.find(qn("p:cSld")).find(qn("p:bg"))
+    bg_copy = reopened.slides[2].element.find(qn("p:cSld")).find(qn("p:bg"))
+    check("iter6: gradient background survives duplicate", bg_first.xml == bg_copy.xml)
+    bg_pic = reopened.slides[3].element.find(qn("p:cSld")).find(qn("p:bg"))
+    copied_rid = bg_pic.find(".//" + qn("a:blip")).get(qn("r:embed"))
+    check("iter6: picture background relation survives duplicate",
+          reopened.slides[3].part.rels[copied_rid].target_part.blob == pic_part.blob)
+
+    cancelled = generate(decorated, TEMPLATE_PPTX, both, {"ФИО": 0}, [["x"], ["y"]],
+                         os.path.join(tmp, "cancel_pptx"), MODE_COMBINED, 0,
+                         cancel_cb=lambda: True)
+    check("iter6: combined pptx cancel has no output", cancelled["cancelled"] and
+          not cancelled["created"] and not any(n.endswith(".pptx") for n in os.listdir(cancelled["out_dir"])))
+    calls = [0]
+    def abort_second():
+        calls[0] += 1
+        return calls[0] >= 2
+    cancelled_pdf = generate(T_PDF, TEMPLATE_PDF, pfields, cm, rows[:2],
+                             os.path.join(tmp, "cancel_pdf"), MODE_COMBINED, 0,
+                             cancel_cb=abort_second)
+    check("iter6: combined pdf cancel has no output", cancelled_pdf["cancelled"] and
+          not cancelled_pdf["created"] and not any(n.endswith(".pdf") for n in os.listdir(cancelled_pdf["out_dir"])))
+    atom_dir = os.path.join(tmp, "atomic")
+    initial = generate(decorated, TEMPLATE_PPTX, both, {"ФИО": 0}, [["Исходный"]],
+                       atom_dir, MODE_COMBINED, 0)
+    target = os.path.join(atom_dir, initial["created"][0][1])
+    before_hash = _sha(target)
+    with patch("app.core.generator.os.replace", side_effect=OSError("no write")):
+        failed = generate(decorated, TEMPLATE_PPTX, both, {"ФИО": 0}, [["Новый"]],
+                          atom_dir, MODE_COMBINED, 0)
+    check("iter6: failed save keeps existing output", not failed["created"] and
+          _sha(target) == before_hash and any("no write" in r for _, r in failed["skipped"]))
+
+    tree = Presentation()
+    sl = tree.slides.add_slide(tree.slide_layouts[6])
+    group = sl.shapes.add_group_shape()
+    inner = group.shapes.add_group_shape()
+    box = inner.shapes.add_textbox(Cm(2), Cm(2), Cm(8), Cm(2))
+    box.text = "Группа @@FIO@@"
+    table = sl.shapes.add_table(2, 2, Cm(2), Cm(7), Cm(12), Cm(4)).table
+    table.cell(1, 0).text = "@@FIO@@"
+    tree_file = os.path.join(tmp, "tree.pptx")
+    tree.save(tree_file)
+    tb = pptx_engine.list_text_shapes(Presentation(tree_file))
+    grp_block = next(b for b in tb if "Группа" in b["text"])
+    cell_block = next(b for b in tb if b["cell"] == (1, 0))
+    tree_fields = [Field("ФИО", [PptxPlacement(0, grp_block["shape_id"], token="@@FIO@@", mode="token"),
+                                  PptxPlacement(0, cell_block["shape_id"], token="@@FIO@@",
+                                                mode="token", cell=cell_block["cell"])])]
+    tree_rep = generate(tree_file, TEMPLATE_PPTX, tree_fields, {"ФИО": 0}, [["Участник"]],
+                        os.path.join(tmp, "tree_out"), MODE_SEPARATE, 0)
+    new_tree = pptx_engine.list_text_shapes(Presentation(os.path.join(tmp, "tree_out", tree_rep["created"][0][1])))
+    check("iter6: nested groups and table cells", any(b["text"] == "Группа Участник" for b in new_tree)
+          and any(b["cell"] == (1, 0) and b["text"] == "Участник" for b in new_tree))
+    check("iter6: table cell mapping roundtrip", PptxPlacement.from_dict(
+          tree_fields[0].placements[1].to_dict()).cell == (1, 0))
+    mismatch = pptx_engine.apply_field_to_slide(sl, PptxPlacement(0, box.shape_id,
+                                                token="НЕСОВПАДЕНИЕ", mode="fragment"), "X")
+    check("iter6: mismatch preserves text", box.text == "Группа @@FIO@@" and mismatch)
+    keep_field = Field("ФИО", [PptxPlacement(0, box.shape_id)], source="keep")
+    check("iter6: optional keep does not clear template", "ФИО" not in row_values([keep_field], {}, []))
+    req_field = Field("ФИО", [PptxPlacement(0, n0.shape_id)], required=True)
+    invalid = generate(decorated, TEMPLATE_PPTX, [req_field], {}, [["Тест"]],
+                       os.path.join(tmp, "invalid"), MODE_COMBINED, 0)
+    check("iter6: missing required column blocks generation", not invalid["created"]
+          and any(r == 0 for r, _ in invalid["skipped"]))
+    empty_case = generate(decorated, TEMPLATE_PPTX, [req_field], {"ФИО": 0},
+                          [["Готов"], [""], ["Далее"]], os.path.join(tmp, "папка результата"),
+                          MODE_COMBINED, 0)
+    empty_slides = Presentation(os.path.join(empty_case["out_dir"], empty_case["created"][0][1]))
+    check("iter6: blank row omitted with source row preserved", len(empty_slides.slides) == 4
+          and any(r == 3 and "пуст" in why for r, why in empty_case["skipped"]))
+    fifty = generate(T_PPTX, TEMPLATE_PPTX, fields, cm, rows[:5] * 10,
+                     os.path.join(tmp, "50 дипломов"), MODE_COMBINED, 0)
+    fifty_file = os.path.join(fifty["out_dir"], fifty["created"][0][1])
+    check("iter6: 50 rows combined pptx reopens", len(fifty["created"]) == 50
+          and len(Presentation(fifty_file).slides) == 50)
+
+    real_template = "/Users/denis/Downloads/Диплом ЛВТ.pptx"
+    real_excel = "/Users/denis/Downloads/test-participants.xlsx"
+    if os.path.isfile(real_template) and os.path.isfile(real_excel):
+        th, xh = _sha(real_template), _sha(real_excel)
+        rh, rr = excel_reader.read_xlsx(real_excel)
+        real_blocks = pptx_engine.list_text_shapes(Presentation(real_template))
+        signatures = {"ФИО": "ИВАНОВ ИВАН ИВАНОВИЧ", "Номинация": "Номинация: «",
+                      "Управление": "УФНС России по субъекту РФ"}
+        field_map = []
+        for field_name, signature in signatures.items():
+            b = next(b for b in real_blocks if signature in b["text"])
+            token = b["text"].split("«", 1)[1].split("»", 1)[0] if field_name == "Номинация" else ""
+            field_map.append(Field(field_name, [PptxPlacement(0, b["shape_id"], b["text"],
+                                token, "fragment" if token else "whole")], required=True))
+        real_out = os.path.join(tmp, "real")
+        real_rep = generate(real_template, TEMPLATE_PPTX, field_map,
+                            {name: rh.index(name) for name in signatures}, rr,
+                            real_out, MODE_COMBINED, rh.index("ФИО"))
+        real_result = Presentation(os.path.join(real_out, real_rep["created"][0][1]))
+        text_rows = [[s.text_frame.text for s in slide.shapes if s.has_text_frame]
+                     for slide in real_result.slides]
+        check("iter6: real workbook six slides in row order", len(text_rows) == 6 and all(
+              all(rr[i][rh.index(name)] in " ".join(text_rows[i]) for name in signatures)
+              for i in range(6)))
+        check("iter6: nomination surrounds preserved", all(
+              f"Номинация: «{rr[i][rh.index('Номинация')]}»" in text_rows[i]
+              for i in range(6)))
+        check("iter6: long name explicitly reviewed", any(
+              row == 7 and any("шрифт" in note for note in notes)
+              for row, notes in real_rep["review"]))
+        check("iter6: original template and Excel unchanged", th == _sha(real_template)
+              and xh == _sha(real_excel))
+
     # ---- perf: 150 rows -------------------------------------------------------
     big_rows = [[f"{n} Тестович{i}", REGIONS[i % len(REGIONS)]]
                 for i, n in enumerate(NAMES * 15)]

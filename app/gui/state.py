@@ -12,6 +12,7 @@ class AppState:
     template_path: str | None = None
     template_type: str | None = None  # "pptx" | "pdf"
     fields: list[Field] = field(default_factory=list)
+    slide_sel: list[int] | None = None
 
     excel_path: str | None = None
     sheet_name: str | None = None

@@ -20,7 +20,7 @@ _COLOR_HOVER = QColor(60, 180, 75)
 
 class PreviewCanvas(QWidget):
     sigRectDrawn = Signal(float, float, float, float)  # doc coords (pt)
-    sigShapePicked = Signal(int)                       # pptx shape_id
+    sigShapePicked = Signal(object)                    # (shape_id, cell)
     sigPointClicked = Signal(float, float)             # doc coords (pt), eyedrop
 
     def __init__(self, parent=None):
@@ -158,7 +158,7 @@ class PreviewCanvas(QWidget):
         elif self._mode == MODE_PICK and ev.button() == Qt.LeftButton:
             shp = self._shape_at(ev.position())
             if shp is not None:
-                self.sigShapePicked.emit(shp["shape_id"])
+                self.sigShapePicked.emit((shp["shape_id"], shp.get("cell")))
 
     def mouseMoveEvent(self, ev):
         if self._pix is None:
