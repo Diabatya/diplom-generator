@@ -282,6 +282,8 @@ class StepTemplate(QWidget):
         self.state.template_path = path
         self.state.fields = []
         self.state.colmap = {}
+        self.state.filename_source = ("auto", None)
+        self.state.filename_first_word = False
         self.state.slide_sel = [0] if ext == ".pptx" and self._page_count > 1 else None
         self._page = 0
         self.lbl_template.setText(os.path.basename(path))

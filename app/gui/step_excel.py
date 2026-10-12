@@ -164,6 +164,7 @@ class StepExcel(QWidget):
         self._sheets = sheets
         if self.state.excel_path != path:
             self.state.colmap = {}
+            self.state.filename_source = ("auto", None)
         self.state.excel_path = path
         self.cmb_sheet.blockSignals(True)
         self.cmb_sheet.clear()
