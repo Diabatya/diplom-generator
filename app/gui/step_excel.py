@@ -165,6 +165,9 @@ class StepExcel(QWidget):
         if self.state.excel_path != path:
             self.state.colmap = {}
             self.state.filename_source = ("auto", None)
+            self.state.headers = []
+            self.state.rows = []
+            self.state.sheet_name = None
         self.state.excel_path = path
         self.cmb_sheet.blockSignals(True)
         self.cmb_sheet.clear()
@@ -184,6 +187,11 @@ class StepExcel(QWidget):
             QMessageBox.critical(self, "Excel", f"Не удалось прочитать лист:\n{exc}")
             return
         if not headers or not rows:
+            self.table.clear()
+            self.table.setRowCount(0)
+            self.table.setColumnCount(0)
+            self.cmb_sample.clear()
+            self.txt_issues.setPlainText("Excel-файл пуст: заполните строки участников.")
             QMessageBox.warning(self, "Excel", "Лист пуст или нет данных после строки заголовков.")
             return
         previous = {name: self.state.headers[i] for name, i in self.state.colmap.items()

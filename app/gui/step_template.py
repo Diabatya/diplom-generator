@@ -311,12 +311,13 @@ class StepTemplate(QWidget):
                                 ". Создайте привязки заново; прежняя разметка не загружена.")
                             fields = []
                         self.state.fields = fields
-                        if "filename_source" in extra:
-                            self.state.filename_source = tuple(extra["filename_source"])
-                        if "filename_first_word" in extra:
-                            self.state.filename_first_word = extra["filename_first_word"]
-                        if "slide_sel" in extra:
-                            self.state.slide_sel = extra["slide_sel"]
+                        if not stale:
+                            if "filename_source" in extra:
+                                self.state.filename_source = tuple(extra["filename_source"])
+                            if "filename_first_word" in extra:
+                                self.state.filename_first_word = extra["filename_first_word"]
+                            if "slide_sel" in extra:
+                                self.state.slide_sel = extra["slide_sel"]
                     else:
                         QMessageBox.warning(self, "Разметка", "Тип шаблона в разметке не совпадает.")
                 except Exception as exc:
