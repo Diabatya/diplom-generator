@@ -70,6 +70,7 @@ class PptxPlacement:
     pattern: str = ""
     token: str = ""
     mode: str = "whole"
+    cell: tuple[int, int] | None = None  # (row, col) inside a table shape
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -79,6 +80,7 @@ class PptxPlacement:
             "pattern": self.pattern,
             "token": self.token,
             "mode": self.mode,
+            "cell": list(self.cell) if self.cell else None,
         }
 
     @classmethod
@@ -86,12 +88,14 @@ class PptxPlacement:
         mode = str(d.get("mode", "whole"))
         if mode not in ("whole", "fragment", "token"):
             mode = "whole"
+        cell = d.get("cell")
         return cls(
             slide=int(d["slide"]),
             shape_id=int(d["shape_id"]),
             pattern=str(d.get("pattern", "")),
             token=str(d.get("token", "")),
             mode=mode,
+            cell=(int(cell[0]), int(cell[1])) if cell else None,
         )
 
 
@@ -104,13 +108,18 @@ class Field:
 
     name: str
     placements: list[Placement] = field(default_factory=list)
+    source: str = "column"
+    constant: str = ""
+    required: bool = False
 
     def to_dict(self) -> dict[str, Any]:
-        return {"name": self.name, "placements": [p.to_dict() for p in self.placements]}
+        return {"name": self.name, "placements": [p.to_dict() for p in self.placements],
+                "source": self.source, "constant": self.constant, "required": self.required}
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Field":
-        f = cls(name=str(d["name"]))
+        f = cls(name=str(d["name"]), source=str(d.get("source", "column")),
+                constant=str(d.get("constant", "")), required=bool(d.get("required", False)))
         for pd in d.get("placements", []):
             if pd.get("type") == "pdf_rect":
                 f.placements.append(PdfPlacement.from_dict(pd))

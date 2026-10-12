@@ -511,20 +511,26 @@ def main():
           pptx_engine.detect_token("Выдан: @@FIO@@") == "@@FIO@@")
 
     # ---- P2: token twice in one block does not skew autofit -----------------
+    # Deterministic width stub makes the check platform-independent. Literal
+    # runs "№ " + " + " = 5 chars -> 90 pt at 36 pt; box 14 cm minus margins ->
+    # ~382.4 pt. The second occurrence must be measured at the candidate size
+    # like the first (90 + 2*5.5*s <= 382.4 -> s = 26), not at the literal
+    # 36 pt (90 + 5.5*s + 198 -> s = 21, i.e. the old skewed behaviour).
+    from unittest.mock import patch
     dup_pptx = os.path.join(tmp, "dup_tok.pptx")
     prs_d = Presentation()
     prs_d.slide_width = Cm(29.7)
     prs_d.slide_height = Cm(21)
     sld = prs_d.slides.add_slide(prs_d.slide_layouts[6])
-    tbA = sld.shapes.add_textbox(Cm(2), Cm(5), Cm(8), Cm(3))
+    tbA = sld.shapes.add_textbox(Cm(2), Cm(5), Cm(14), Cm(3))
     ra = tbA.text_frame.paragraphs[0].add_run()
     ra.text = "№ @@FIO@@"
     ra.font.size = Pt(36)
-    tbB = sld.shapes.add_textbox(Cm(2), Cm(10), Cm(8), Cm(3))
+    tbB = sld.shapes.add_textbox(Cm(2), Cm(10), Cm(14), Cm(3))
     rb = tbB.text_frame.paragraphs[0].add_run()
     rb.text = "№ @@FIO@@ + @@FIO@@"
     rb.font.size = Pt(36)
-    tbC = sld.shapes.add_textbox(Cm(2), Cm(15), Cm(8), Cm(3))
+    tbC = sld.shapes.add_textbox(Cm(2), Cm(15), Cm(14), Cm(3))
     rc = tbC.text_frame.paragraphs[0].add_run()
     rc.text = "№ @@FIO@@ + "   # same literal text, token only once
     rc.font.size = Pt(36)
@@ -536,10 +542,12 @@ def main():
                                       token="@@FIO@@", mode="fragment")])]
     fldC = [Field("ФИО", [PptxPlacement(0, sidC, pattern="№ @@FIO@@ + ",
                                       token="@@FIO@@", mode="fragment")])]
-    rep_db = generate(dup_pptx, TEMPLATE_PPTX, fldB, {"ФИО": 0}, [[val]],
-                      os.path.join(tmp, "db"), MODE_SEPARATE, 0, set())
-    rep_dc = generate(dup_pptx, TEMPLATE_PPTX, fldC, {"ФИО": 0}, [[val]],
-                      os.path.join(tmp, "dc"), MODE_SEPARATE, 0, set())
+    with patch("app.core.fonts.measure_text_width",
+               new=lambda text, fp, size: len(text) * size * 0.5):
+        rep_db = generate(dup_pptx, TEMPLATE_PPTX, fldB, {"ФИО": 0}, [[val]],
+                          os.path.join(tmp, "db"), MODE_SEPARATE, 0, set())
+        rep_dc = generate(dup_pptx, TEMPLATE_PPTX, fldC, {"ФИО": 0}, [[val]],
+                          os.path.join(tmp, "dc"), MODE_SEPARATE, 0, set())
 
     def value_sizes(path):
         prs = Presentation(path)
@@ -556,8 +564,615 @@ def main():
     szC = value_sizes(os.path.join(tmp, "dc", rep_dc["created"][0][1]))
     check("duptok: both occurrences replaced", len(szB) == 2, str(szB))
     check("duptok: repeated token does not skew autofit",
-          szB and szC and all(abs(s - szC[0]) < 0.01 for s in szB),
+          szB == [26.0, 26.0] and szC == [36.0],
           f"double={szB} single={szC}")
+
+    from app.core.generator import MAX_PATH_LEN, plan_batch_names, row_values
+    from pptx.dml.color import RGBColor
+    from unittest.mock import patch
+
+    names = plan_batch_names(["Иванов", "Иванов", "Иванов_2", "A", "a", "CON", "con.",
+                              "a/b", "a:b"], tmp, ".pptx", EXISTS_OVERWRITE)
+    actual = [n for n, _ in names]
+    check("iter6: unique casefold names and reserved devices",
+          len(actual) == len(set(n.casefold() for n in actual)) == 9
+          and actual[0:3] == ["Иванов.pptx", "Иванов_2.pptx", "Иванов_2_2.pptx"]
+          and all(os.path.splitext(n)[0].casefold() not in ("con", "nul", "prn")
+                  for n in actual), str(actual))
+    collision_rep = generate(T_PPTX, TEMPLATE_PPTX, fields, cm,
+                             [["Иванов", "X"], ["Иванов", "Y"], ["Иванов_2", "Z"]],
+                             os.path.join(tmp, "batch_collision"), MODE_SEPARATE, 0)
+    check("iter6: batch collision saves three real files", len(collision_rep["created"]) == 3
+          and len({n.casefold() for _, n in collision_rep["created"]}) == 3
+          and all(len(Presentation(os.path.join(collision_rep["out_dir"], n)).slides) == 1
+                  for _, n in collision_rep["created"]))
+    deep = os.path.join(tmp, "д" * max(1, MAX_PATH_LEN - len(tmp) - 85))
+    long_names = [n for n, _ in plan_batch_names(["Ж" * 80] * 3, deep, ".pptx", EXISTS_OVERWRITE)]
+    check("iter6: suffixes survive truncation", len(set(long_names)) == 3
+          and long_names[1].endswith("_2.pptx") and long_names[2].endswith("_3.pptx")
+          and all(len(os.path.join(deep, n)) <= MAX_PATH_LEN for n in long_names), str(long_names))
+    impossible = plan_batch_names(["file"], "/" + "a" * MAX_PATH_LEN, ".pptx", EXISTS_SUFFIX)
+    check("iter6: impossible path diagnosed", impossible[0][0] is None and bool(impossible[0][1]))
+    tight_dir = "/" + "a" * (MAX_PATH_LEN - 1 - len(".pptx") - 3 - 1)
+    tight_name = plan_batch_names(["CON_"], tight_dir, ".pptx", EXISTS_OVERWRITE)[0][0]
+    check("iter6: truncation cannot revive Windows device name",
+          tight_name is not None and os.path.splitext(tight_name)[0].casefold() != "con", str(tight_name))
+
+    decorated = os.path.join(tmp, "decorated.pptx")
+    deck = Presentation()
+    deck.slide_width = Cm(28)
+    deck.slide_height = Cm(20)
+    d0 = deck.slides.add_slide(deck.slide_layouts[6])
+    d0.background.fill.solid()
+    d0.background.fill.fore_color.rgb = RGBColor(12, 34, 56)
+    n0 = d0.shapes.add_textbox(Cm(2), Cm(4), Cm(10), Cm(2))
+    n0.text = "@@FIO@@"
+    d1 = deck.slides.add_slide(deck.slide_layouts[6])
+    d1.background.fill.solid()
+    d1.background.fill.fore_color.rgb = RGBColor(48, 65, 82)
+    n1 = d1.shapes.add_textbox(Cm(2), Cm(4), Cm(10), Cm(2))
+    n1.text = "@@FIO@@"
+    deck.save(decorated)
+    both = [Field("ФИО", [PptxPlacement(i, b.shape_id, token="@@FIO@@", mode="token")
+                          for i, b in enumerate([n0, n1])])]
+    dr = generate(decorated, TEMPLATE_PPTX, both, {"ФИО": 0}, [["Первый"], ["Второй"]],
+                  os.path.join(tmp, "deck"), MODE_COMBINED, 0)
+    result = Presentation(os.path.join(tmp, "deck", dr["created"][0][1]))
+    names_order = [next(s.text_frame.text for s in sl.shapes if s.has_text_frame)
+                   for sl in result.slides]
+    colors = [str(sl.background.fill.fore_color.rgb) for sl in result.slides]
+    check("iter6: deck grouped by row", names_order == ["Первый", "Первый", "Второй", "Второй"], str(names_order))
+    check("iter6: solid slide-level backgrounds copied",
+          colors == ["0C2238", "304152", "0C2238", "304152"], str(colors))
+    one = generate(decorated, TEMPLATE_PPTX, both, {"ФИО": 0}, [["Первый"], ["Второй"]],
+                   os.path.join(tmp, "deck_one"), MODE_COMBINED, 0, slide_sel=[1])
+    selected = Presentation(os.path.join(tmp, "deck_one", one["created"][0][1]))
+    check("iter6: selected slide only", len(selected.slides) == 2 and
+          [str(sl.background.fill.fore_color.rgb) for sl in selected.slides] == ["304152"] * 2)
+    from pptx.oxml.xmlchemy import OxmlElement
+    from pptx.oxml.ns import qn
+    from pptx.opc.constants import RELATIONSHIP_TYPE as RT
+    styled = Presentation(decorated)
+    p_bg = styled.slides[0].element.find(qn("p:cSld")).find(qn("p:bg"))
+    p_bg.remove(p_bg[0])
+    grad = OxmlElement("p:bgPr")
+    grad_fill = OxmlElement("a:gradFill")
+    grad_stops = OxmlElement("a:gsLst")
+    for pos, hexcolor in (("0", "0C2238"), ("100000", "FFFFFF")):
+        stop = OxmlElement("a:gs")
+        stop.set("pos", pos)
+        color = OxmlElement("a:srgbClr")
+        color.set("val", hexcolor)
+        stop.append(color)
+        grad_stops.append(stop)
+    grad_fill.append(grad_stops)
+    grad.append(grad_fill)
+    p_bg.append(grad)
+    pic = next(s for s in Presentation(T_PPTX).slides[0].shapes
+               if s.shape_type == MSO_SHAPE_TYPE.PICTURE)
+    pic_part = pic.part.rels[pic._element.blip_rId].target_part
+    image_slide = styled.slides[1]
+    image_bg = image_slide.element.find(qn("p:cSld")).find(qn("p:bg"))
+    image_bg.remove(image_bg[0])
+    image_pr = OxmlElement("p:bgPr")
+    blip_fill = OxmlElement("a:blipFill")
+    blip = OxmlElement("a:blip")
+    blip.set(qn("r:embed"), image_slide.part.rels.get_or_add(RT.IMAGE, pic_part))
+    blip_fill.append(blip)
+    image_pr.append(blip_fill)
+    image_bg.append(image_pr)
+    styled_file = os.path.join(tmp, "backgrounds.pptx")
+    styled.save(styled_file)
+    styled_rep = generate(styled_file, TEMPLATE_PPTX, both, {"ФИО": 0},
+                          [["Первый"], ["Второй"]], os.path.join(tmp, "backgrounds"), MODE_COMBINED, 0)
+    reopened = Presentation(os.path.join(tmp, "backgrounds", styled_rep["created"][0][1]))
+    bg_first = reopened.slides[0].element.find(qn("p:cSld")).find(qn("p:bg"))
+    bg_copy = reopened.slides[2].element.find(qn("p:cSld")).find(qn("p:bg"))
+    check("iter6: gradient background survives duplicate", bg_first.xml == bg_copy.xml)
+    bg_pic = reopened.slides[3].element.find(qn("p:cSld")).find(qn("p:bg"))
+    copied_rid = bg_pic.find(".//" + qn("a:blip")).get(qn("r:embed"))
+    check("iter6: picture background relation survives duplicate",
+          reopened.slides[3].part.rels[copied_rid].target_part.blob == pic_part.blob)
+
+    cancelled = generate(decorated, TEMPLATE_PPTX, both, {"ФИО": 0}, [["x"], ["y"]],
+                         os.path.join(tmp, "cancel_pptx"), MODE_COMBINED, 0,
+                         cancel_cb=lambda: True)
+    check("iter6: combined pptx cancel has no output", cancelled["cancelled"] and
+          not cancelled["created"] and not any(n.endswith(".pptx") for n in os.listdir(cancelled["out_dir"])))
+    calls = [0]
+    def abort_second():
+        calls[0] += 1
+        return calls[0] >= 2
+    cancelled_pdf = generate(T_PDF, TEMPLATE_PDF, pfields, cm, rows[:2],
+                             os.path.join(tmp, "cancel_pdf"), MODE_COMBINED, 0,
+                             cancel_cb=abort_second)
+    check("iter6: combined pdf cancel has no output", cancelled_pdf["cancelled"] and
+          not cancelled_pdf["created"] and not any(n.endswith(".pdf") for n in os.listdir(cancelled_pdf["out_dir"])))
+    atom_dir = os.path.join(tmp, "atomic")
+    initial = generate(decorated, TEMPLATE_PPTX, both, {"ФИО": 0}, [["Исходный"]],
+                       atom_dir, MODE_COMBINED, 0)
+    target = os.path.join(atom_dir, initial["created"][0][1])
+    before_hash = _sha(target)
+    with patch("app.core.generator.os.replace", side_effect=OSError("no write")):
+        failed = generate(decorated, TEMPLATE_PPTX, both, {"ФИО": 0}, [["Новый"]],
+                          atom_dir, MODE_COMBINED, 0)
+    check("iter6: failed save keeps existing output", not failed["created"] and
+          _sha(target) == before_hash and any("no write" in r for _, r in failed["skipped"]))
+    pdf_atom_dir = os.path.join(tmp, "atomic_pdf")
+    pdf_initial = generate(T_PDF, TEMPLATE_PDF, pfields, cm, rows[:1],
+                           pdf_atom_dir, MODE_COMBINED, 0)
+    pdf_target = os.path.join(pdf_atom_dir, pdf_initial["created"][0][1])
+    pdf_hash = _sha(pdf_target)
+    with patch("app.core.generator.os.replace", side_effect=OSError("no write")):
+        pdf_failed = generate(T_PDF, TEMPLATE_PDF, pfields, cm, rows[1:2],
+                              pdf_atom_dir, MODE_COMBINED, 0)
+    check("iter6: failed combined pdf save keeps existing output",
+          not pdf_failed["created"] and _sha(pdf_target) == pdf_hash
+          and any("no write" in reason for _, reason in pdf_failed["skipped"]))
+
+    tree = Presentation()
+    sl = tree.slides.add_slide(tree.slide_layouts[6])
+    group = sl.shapes.add_group_shape()
+    inner = group.shapes.add_group_shape()
+    box = inner.shapes.add_textbox(Cm(2), Cm(2), Cm(8), Cm(2))
+    box.text = "Группа @@FIO@@"
+    table = sl.shapes.add_table(2, 2, Cm(2), Cm(7), Cm(12), Cm(4)).table
+    table.cell(1, 0).text = "@@FIO@@"
+    tree_file = os.path.join(tmp, "tree.pptx")
+    tree.save(tree_file)
+    tb = pptx_engine.list_text_shapes(Presentation(tree_file))
+    grp_block = next(b for b in tb if "Группа" in b["text"])
+    cell_block = next(b for b in tb if b["cell"] == (1, 0))
+    tree_fields = [Field("ФИО", [PptxPlacement(0, grp_block["shape_id"], token="@@FIO@@", mode="token"),
+                                  PptxPlacement(0, cell_block["shape_id"], token="@@FIO@@",
+                                                mode="token", cell=cell_block["cell"])])]
+    tree_rep = generate(tree_file, TEMPLATE_PPTX, tree_fields, {"ФИО": 0}, [["Участник"]],
+                        os.path.join(tmp, "tree_out"), MODE_SEPARATE, 0)
+    new_tree = pptx_engine.list_text_shapes(Presentation(os.path.join(tmp, "tree_out", tree_rep["created"][0][1])))
+    check("iter6: nested groups and table cells", any(b["text"] == "Группа Участник" for b in new_tree)
+          and any(b["cell"] == (1, 0) and b["text"] == "Участник" for b in new_tree))
+    check("iter6: table cell mapping roundtrip", PptxPlacement.from_dict(
+          tree_fields[0].placements[1].to_dict()).cell == (1, 0))
+    mismatch = pptx_engine.apply_field_to_slide(sl, PptxPlacement(0, box.shape_id,
+                                                token="НЕСОВПАДЕНИЕ", mode="fragment"), "X")
+    check("iter6: mismatch preserves text", box.text == "Группа @@FIO@@" and mismatch)
+    keep_field = Field("ФИО", [PptxPlacement(0, box.shape_id)], source="keep")
+    check("iter6: optional keep does not clear template", "ФИО" not in row_values([keep_field], {}, []))
+    req_field = Field("ФИО", [PptxPlacement(0, n0.shape_id)], required=True)
+    invalid = generate(decorated, TEMPLATE_PPTX, [req_field], {}, [["Тест"]],
+                       os.path.join(tmp, "invalid"), MODE_COMBINED, 0)
+    check("iter6: missing required column blocks generation", not invalid["created"]
+          and any(r == 0 for r, _ in invalid["skipped"]))
+    empty_case = generate(decorated, TEMPLATE_PPTX, [req_field], {"ФИО": 0},
+                          [["Готов"], [""], ["Далее"]], os.path.join(tmp, "папка результата"),
+                          MODE_COMBINED, 0)
+    empty_slides = Presentation(os.path.join(empty_case["out_dir"], empty_case["created"][0][1]))
+    check("iter6: blank row omitted with source row preserved", len(empty_slides.slides) == 4
+          and any(r == 3 and "пуст" in why for r, why in empty_case["skipped"]))
+    fifty = generate(T_PPTX, TEMPLATE_PPTX, fields, cm, rows[:5] * 10,
+                     os.path.join(tmp, "50 дипломов"), MODE_COMBINED, 0)
+    fifty_file = os.path.join(fifty["out_dir"], fifty["created"][0][1])
+    check("iter6: 50 rows combined pptx reopens", len(fifty["created"]) == 50
+          and len(Presentation(fifty_file).slides) == 50)
+
+    guarded = Field("ФИО", [PptxPlacement(0, n0.shape_id, token="@@FIO@@", mode="token")],
+                    required=True)
+    guarded_dir = os.path.join(tmp, "guarded")
+    valid_guard = generate(decorated, TEMPLATE_PPTX,
+                           [Field("ФИО", [PptxPlacement(1, n1.shape_id, token="@@FIO@@",
+                                                      mode="token")], required=True)],
+                           {"ФИО": 0}, [["Участник А"], ["Участник Б"]],
+                           guarded_dir, MODE_COMBINED, 0, slide_sel=[1])
+    guarded_file = os.path.join(guarded_dir, valid_guard["created"][0][1])
+    original_guard_hash = _sha(guarded_file)
+    blocked_combined = generate(decorated, TEMPLATE_PPTX, [guarded], {"ФИО": 0},
+                                [["Участник А"], ["Участник Б"]], guarded_dir,
+                                MODE_COMBINED, 0, slide_sel=[1])
+    blocked_separate = generate(decorated, TEMPLATE_PPTX, [guarded], {"ФИО": 0},
+                                [["Участник А"], ["Участник Б"]],
+                                os.path.join(tmp, "guarded_separate"), MODE_SEPARATE,
+                                0, slide_sel=[1])
+    check("review6: excluded required placement blocks both modes",
+          not blocked_combined["created"] and not blocked_separate["created"]
+          and any("ФИО" in reason for _, reason in blocked_combined["skipped"])
+          and _sha(guarded_file) == original_guard_hash)
+    check("review6: valid selected slide uses each row",
+          [next(s.text_frame.text for s in sl.shapes if s.has_text_frame)
+           for sl in Presentation(guarded_file).slides] == ["Участник А", "Участник Б"])
+    wrong_token = Field("ФИО", [PptxPlacement(1, n1.shape_id, token="@@MISSING@@",
+                                             mode="token")], required=True)
+    wrong_shape = Field("ФИО", [PptxPlacement(1, 999999)], required=True)
+    for name, bad_field in (("token", wrong_token), ("shape", wrong_shape)):
+        blocked = generate(decorated, TEMPLATE_PPTX, [bad_field], {"ФИО": 0},
+                           [["Участник А"]], guarded_dir, MODE_COMBINED, 0,
+                           slide_sel=[1])
+        check(f"review6: invalid required {name} preserves existing output",
+              not blocked["created"] and _sha(guarded_file) == original_guard_hash
+              and any("ФИО" in reason for _, reason in blocked["skipped"]))
+    optional_excluded = Field("Номинация", [PptxPlacement(0, n0.shape_id)])
+    optional_rep = generate(decorated, TEMPLATE_PPTX,
+                            [Field("ФИО", [PptxPlacement(1, n1.shape_id, token="@@FIO@@",
+                                                       mode="token")], required=True),
+                             optional_excluded], {"ФИО": 0}, [["Участник А"]],
+                            os.path.join(tmp, "optional_excluded"), MODE_COMBINED, 0,
+                            slide_sel=[1])
+    check("review6: optional excluded placement does not block", len(optional_rep["created"]) == 1)
+
+    inherited = Presentation()
+    inherited_slide = inherited.slides.add_slide(inherited.slide_layouts[6])
+    inherited_box = inherited_slide.shapes.add_textbox(Pt(5), Pt(5), Pt(300), Pt(100))
+    inherited_box.text_frame.word_wrap = False
+    inherited_box.text_frame.margin_left = 0
+    inherited_box.text_frame.margin_right = 0
+    inherited_box.text_frame.margin_top = 0
+    inherited_box.text_frame.margin_bottom = 0
+    ip = inherited_box.text_frame.paragraphs[0]
+    ip.font.name = "Arial"
+    ip.font.size = Pt(44)
+    ip.add_run().text = "@@FIO@@"
+    inherited_note = pptx_engine.apply_field_to_slide(
+        inherited_slide, PptxPlacement(0, inherited_box.shape_id,
+                                       token="@@FIO@@", mode="fragment"), "Тестовый Участник А")
+    inherited_run = next(r for r in ip.runs if "Тестовый" in r.text)
+    check("review6: paragraph font inherited for fragment",
+          inherited_run.font.size is not None and inherited_run.font.size.pt < 44
+          and any("уменьшен" in note or "не поместился" in note for note in inherited_note),
+          str(inherited_note))
+
+    inherited_master = Presentation()
+    master_style = inherited_master.slide_masters[0].element.find(qn("p:txStyles"))
+    # text boxes are styled by p:otherStyle (bodyStyle is for placeholders)
+    level = master_style.find(qn("p:otherStyle")).find(qn("a:lvl1pPr"))
+    master_rpr = level.find(qn("a:defRPr"))
+    master_rpr.set("sz", "4400")
+    master_rpr.find(qn("a:latin")).set("typeface", "Arial")
+    master_slide = inherited_master.slides.add_slide(inherited_master.slide_layouts[6])
+    master_box = master_slide.shapes.add_textbox(Pt(5), Pt(5), Pt(300), Pt(100))
+    master_box.text_frame.word_wrap = False
+    master_box.text_frame.margin_left = 0
+    master_box.text_frame.margin_right = 0
+    master_box.text_frame.paragraphs[0].add_run().text = "@@FIO@@"
+    master_note = pptx_engine.apply_field_to_slide(
+        master_slide, PptxPlacement(0, master_box.shape_id,
+                                    token="@@FIO@@", mode="fragment"), "Тестовый Участник А")
+    master_run = next(r for r in master_box.text_frame.paragraphs[0].runs if "Тестовый" in r.text)
+    check("review6: master font inherited for fragment",
+          master_run.font.size is not None and master_run.font.size.pt < 44
+          and any("уменьшен" in note or "не поместился" in note for note in master_note),
+          str(master_note))
+    inherited_layout = Presentation()
+    layout_shape = next(x for x in inherited_layout.slide_layouts[1].placeholders
+                        if x.placeholder_format.idx == 1)
+    layout_shape.text_frame.paragraphs[0].font.size = Pt(44)
+    layout_shape.text_frame.paragraphs[0].font.name = "Arial"
+    layout_slide = inherited_layout.slides.add_slide(inherited_layout.slide_layouts[1])
+    layout_box = next(x for x in layout_slide.placeholders if x.placeholder_format.idx == 1)
+    layout_box.width = Pt(300)
+    layout_box.height = Pt(100)
+    layout_box.text_frame.word_wrap = False
+    layout_box.text_frame.margin_left = 0
+    layout_box.text_frame.margin_right = 0
+    layout_box.text_frame.paragraphs[0].add_run().text = "@@FIO@@"
+    layout_file = os.path.join(tmp, "layout_font.pptx")
+    inherited_layout.save(layout_file)
+    loaded_layout = Presentation(layout_file).slides[0]
+    loaded_box = next(x for x in loaded_layout.placeholders if x.placeholder_format.idx == 1)
+    layout_note = pptx_engine.apply_field_to_slide(
+        loaded_layout, PptxPlacement(0, loaded_box.shape_id,
+                                     token="@@FIO@@", mode="fragment"), "Тестовый Участник А")
+    layout_run = next(r for r in loaded_box.text_frame.paragraphs[0].runs if "Тестовый" in r.text)
+    check("review6: layout font inherited for fragment",
+          layout_run.font.size is not None and layout_run.font.size.pt < 44
+          and any("уменьшен" in note or "не поместился" in note for note in layout_note),
+          str(layout_note))
+
+    from lxml import etree
+    styled_slide = Presentation(decorated)
+    styled_slide.slides[0].element.set("showMasterSp", "0")
+    styled_slide.slides[0].element.set("showMasterPhAnim", "0")
+    styled_slide.slides[0].element.set("show", "0")
+    source_color = styled_slide.slides[0].element.find(qn("p:clrMapOvr"))
+    source_color.remove(source_color[0])
+    override = OxmlElement("a:overrideClrMapping")
+    for key, value in {"accent1": "accent2", "accent2": "accent1", "accent3": "accent3",
+                       "accent4": "accent4", "accent5": "accent5", "accent6": "accent6",
+                       "bg1": "lt1", "bg2": "lt2", "tx1": "dk1", "tx2": "dk2",
+                       "hlink": "hlink", "folHlink": "folHlink"}.items():
+        override.set(key, value)
+    source_color.append(override)
+    styled_file = os.path.join(tmp, "master_hidden.pptx")
+    styled_slide.save(styled_file)
+    hidden_rep = generate(styled_file, TEMPLATE_PPTX, both, {"ФИО": 0},
+                          [["Участник А"], ["Участник Б"]],
+                          os.path.join(tmp, "hidden_out"), MODE_COMBINED, 0)
+    hidden_result = Presentation(os.path.join(tmp, "hidden_out", hidden_rep["created"][0][1]))
+    hidden_source, hidden_copy = hidden_result.slides[0], hidden_result.slides[2]
+    check("review6: slide visibility flags and color mapping copied",
+          all(hidden_source.element.get(attr) == hidden_copy.element.get(attr) == "0"
+              for attr in ("showMasterSp", "showMasterPhAnim", "show"))
+          and etree.tostring(hidden_copy.element.find(qn("p:clrMapOvr"))) ==
+              etree.tostring(hidden_source.element.find(qn("p:clrMapOvr"))))
+
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+    from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
+    from app.gui.state import AppState
+    from app.gui.step_excel import StepExcel
+    gui_app = QApplication.instance() or QApplication([])
+    sheets_path = os.path.join(tmp, "two_sheets.xlsx")
+    sheets_book = openpyxl.Workbook()
+    filled_sheet = sheets_book.active
+    filled_sheet.title = "Filled"
+    filled_sheet.append(["ФИО"])
+    filled_sheet.append(["Участник А"])
+    empty_sheet = sheets_book.create_sheet("Empty")
+    empty_sheet.append(["ФИО"])
+    sheets_book.save(sheets_path)
+    sheets_book.close()
+    gui_state = AppState(fields=[Field("ФИО", required=True)])
+    navigations = []
+    step = StepExcel(gui_state, lambda: navigations.append(True), lambda: None)
+    with patch.object(QFileDialog, "getOpenFileName", return_value=(sheets_path, "")), \
+         patch.object(QMessageBox, "warning", return_value=QMessageBox.Ok):
+        step._open_excel()
+        step.cmb_sheet.setCurrentIndex(1)
+        step._next()
+        check("review6: empty worksheet clears GUI data and blocks next",
+              not gui_state.rows and gui_state.sheet_name == "Empty"
+              and step.table.rowCount() == 0 and not navigations)
+        step.cmb_sheet.setCurrentIndex(0)
+        check("review6: returning to filled worksheet restores mapping",
+              gui_state.rows == [["Участник А"]] and gui_state.colmap == {"ФИО": 0})
+    with patch("app.gui.step_excel.excel_reader.read_xlsx", side_effect=OSError("read failed")), \
+         patch.object(QMessageBox, "critical", return_value=QMessageBox.Ok):
+        step.cmb_sheet.setCurrentIndex(1)
+    check("review6: failed worksheet read clears active participants",
+          gui_state.sheet_name == "Empty" and not gui_state.rows
+          and not step.btn_next.isEnabled())
+    step.close()
+    from app.gui.step_template import StepTemplate
+    from app.gui.step_generate import StepGenerate
+    invalid_state = AppState(template_path=decorated, template_type=TEMPLATE_PPTX,
+                             fields=[guarded], slide_sel=[1], rows=[["Участник А"]],
+                             colmap={"ФИО": 0}, out_dir=tmp)
+    blocked_navigation = []
+    template_step = StepTemplate(invalid_state, lambda: blocked_navigation.append(True))
+    template_step._prs = Presentation(decorated)
+    generator_step = StepGenerate(invalid_state, lambda: None, lambda: None)
+    with patch.object(QMessageBox, "warning", return_value=QMessageBox.Ok):
+        template_step._next()
+        generator_step._start()
+    check("review6: GUI blocks invalid required slide binding",
+          not blocked_navigation and generator_step._worker is None)
+    template_step.close()
+    generator_step.close()
+
+    # ---- review7: empty sheet with a different schema keeps the mapping ---
+    swap_path = os.path.join(tmp, "swap_sheets.xlsx")
+    swap_book = openpyxl.Workbook()
+    ws_filled = swap_book.active
+    ws_filled.title = "Filled"
+    ws_filled.append(["Номинация", "ФИО", "Регион"])
+    ws_filled.append(["Тестовая номинация", "Участник А", "Тестовый регион"])
+    ws_empty = swap_book.create_sheet("Empty")
+    ws_empty.append(["ФИО", "Номинация"])   # same titles, reversed order, no rows
+    swap_book.create_sheet("Broken").append(["ФИО"])
+    swap_book.save(swap_path)
+    swap_book.close()
+    swap_state = AppState(fields=[Field("ФИО", required=True), Field("Номинация"),
+                                  Field("Регион"), Field("Город")])
+    step2 = StepExcel(swap_state, lambda: None, lambda: None)
+    expected_map = {"ФИО": 1, "Номинация": 0, "Регион": 2, "Город": 2}
+    with patch.object(QFileDialog, "getOpenFileName", return_value=(swap_path, "")), \
+         patch.object(QMessageBox, "warning", return_value=QMessageBox.Ok):
+        step2._open_excel()
+        # manual mapping of a non-standard field name to the "Регион" column
+        step2._combos["Город"].setCurrentIndex(4)
+        check("review7: initial map set", swap_state.colmap == expected_map,
+              str(swap_state.colmap))
+        step2.cmb_sheet.setCurrentIndex(1)   # Empty with reversed headers
+        step2.cmb_sheet.setCurrentIndex(0)   # back to Filled
+        check("review7: swapped empty sheet keeps column mapping",
+              swap_state.colmap == expected_map, str(swap_state.colmap))
+    real_read = excel_reader.read_xlsx
+    def flaky_read(path, sheet=None):
+        if sheet == "Broken":
+            raise OSError("read failed")
+        return real_read(path, sheet)
+    with patch("app.gui.step_excel.excel_reader.read_xlsx", side_effect=flaky_read), \
+         patch.object(QMessageBox, "critical", return_value=QMessageBox.Ok):
+        step2.cmb_sheet.setCurrentIndex(2)   # Broken: read error
+    with patch.object(QMessageBox, "warning", return_value=QMessageBox.Ok):
+        step2.cmb_sheet.setCurrentIndex(0)
+    check("review7: read failure keeps column mapping",
+          swap_state.colmap == expected_map, str(swap_state.colmap))
+    # end-to-end: generated PPTX must put each value in its own block
+    mini = Presentation()
+    mini_slide = mini.slides.add_slide(mini.slide_layouts[6])
+    m_fio = mini_slide.shapes.add_textbox(Cm(1), Cm(2), Cm(10), Cm(2))
+    m_fio.text_frame.text = "@@FIO@@"
+    m_nom = mini_slide.shapes.add_textbox(Cm(1), Cm(6), Cm(14), Cm(2))
+    m_nom.text_frame.text = "Номинация: «Тестовая номинация»"
+    mini_file = os.path.join(tmp, "mini.pptx")
+    mini.save(mini_file)
+    mini_fields = [
+        Field("ФИО", [PptxPlacement(0, m_fio.shape_id, "@@FIO@@", "@@FIO@@",
+                                    "token")], required=True),
+        Field("Номинация", [PptxPlacement(0, m_nom.shape_id, m_nom.text_frame.text,
+                                          "Тестовая номинация", "fragment")],
+              required=True),
+    ]
+    mini_rep = generate(mini_file, TEMPLATE_PPTX, mini_fields,
+                        {k: v for k, v in swap_state.colmap.items() if k != "Город"},
+                        swap_state.rows, os.path.join(tmp, "mini_out"),
+                        MODE_SEPARATE, swap_state.colmap["ФИО"])
+    mini_texts = [s.text_frame.text for s in Presentation(
+        os.path.join(tmp, "mini_out", mini_rep["created"][0][1])).slides[0].shapes
+        if s.has_text_frame]
+    check("review7: generated file puts values in the right blocks",
+          "Участник А" in mini_texts
+          and "Номинация: «Тестовая номинация»" in mini_texts, str(mini_texts))
+    step2.close()
+    gui_app.quit()
+
+    # ---- review7: group scale does not fool autofit -----------------------
+    def scaled_group_deck(scale_x, scale_y, nested=False):
+        deck = Presentation()
+        s = deck.slides.add_slide(deck.slide_layouts[6])
+        grp = s.shapes.add_group_shape()
+        parent = grp
+        if nested:
+            inner = grp.shapes.add_group_shape()
+            parent = inner
+        box = parent.shapes.add_textbox(Pt(5), Pt(5), Pt(300), Pt(100))
+        tf = box.text_frame
+        tf.margin_left = tf.margin_right = tf.margin_top = tf.margin_bottom = 0
+        tf.word_wrap = False
+        par = tf.paragraphs[0]
+        par.font.name = "Arial"
+        par.font.size = Pt(44)
+        par.add_run().text = "@@FIO@@"
+        if nested:
+            inner.width = int(inner.width * 2)
+            inner.height = int(inner.height * 2)
+        grp.width = int(grp.width * scale_x)
+        grp.height = int(grp.height * scale_y)
+        return s, box
+
+    for tag, sx, sy, nested in (("x2", 2, 2, False), ("x0.5", 0.5, 0.5, False),
+                                ("nested", 2, 2, True), ("aniso", 2, 1, False)):
+        gs, gbox = scaled_group_deck(sx, sy, nested)
+        gnote = pptx_engine.apply_field_to_slide(
+            gs, PptxPlacement(0, gbox.shape_id, token="@@FIO@@", mode="fragment"),
+            "Тестовый Участник А")
+        grun = next(r for r in gbox.text_frame.paragraphs[0].runs if "Тестовый" in r.text)
+        check(f"review7: group {tag} autofit uses local coords",
+              grun.font.size is not None and grun.font.size.pt < 44
+              and any("уменьшен" in n or "не поместился" in n for n in gnote),
+              f"notes={gnote} size={grun.font.size}")
+
+    # ---- review7: shape text resolves p:otherStyle ------------------------
+    from pptx.enum.shapes import MSO_SHAPE
+    from app.core.fonts import measure_text_width
+    style_deck = Presentation()
+    tx = style_deck.slide_masters[0].element.find(qn("p:txStyles"))
+    body_rpr = tx.find(qn("p:bodyStyle")).find(qn("a:lvl1pPr")).find(qn("a:defRPr"))
+    body_rpr.set("sz", "3200")
+    body_rpr.set("b", "1")
+    body_rpr.find(qn("a:latin")).set("typeface", "Times New Roman")
+    other_rpr = tx.find(qn("p:otherStyle")).find(qn("a:lvl1pPr")).find(qn("a:defRPr"))
+    other_rpr.set("sz", "4400")
+    other_rpr.find(qn("a:latin")).set("typeface", "Arial")
+    style_slide = style_deck.slides.add_slide(style_deck.slide_layouts[6])
+    rect = style_slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Pt(5), Pt(5), Pt(300), Pt(100))
+    rect.text_frame.margin_left = rect.text_frame.margin_right = 0
+    rect.text_frame.word_wrap = False
+    rect.text_frame.text = "@@FIO@@"
+    eff = pptx_engine._effective_run_style(
+        style_slide, rect, rect.text_frame, rect.text_frame.paragraphs[0],
+        rect.text_frame.paragraphs[0].runs[0]._r)
+    check("review7: autoshape resolves otherStyle (size/family/bold)",
+          eff == (44.0, "Arial", False), str(eff))
+    arial = find_font_file("Arial")
+    aval = "Участник Тестовый"
+    overflow_at_44 = measure_text_width(aval, arial, 44) > 300
+    s_note = pptx_engine.apply_field_to_slide(
+        style_slide, PptxPlacement(0, rect.shape_id, token="@@FIO@@",
+                                   mode="fragment"), aval)
+    s_run = next(r for r in rect.text_frame.paragraphs[0].runs if "Участник" in r.text)
+    check("review7: autoshape fragment uses otherStyle size",
+          (not overflow_at_44) or
+          (any("уменьшен" in n or "не поместился" in n for n in s_note)
+           and s_run.font.size is not None and s_run.font.size.pt < 44),
+          f"notes={s_note} w44={measure_text_width(aval, arial, 44):.0f}")
+    rect2 = style_slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Pt(5), Pt(200), Pt(300), Pt(100))
+    rect2.text_frame.margin_left = rect2.text_frame.margin_right = 0
+    rect2.text_frame.word_wrap = False
+    rect2.text_frame.text = "Шаблонный текст"
+    w_note = pptx_engine.apply_field_to_slide(
+        style_slide, PptxPlacement(0, rect2.shape_id, "Шаблонный текст", "", "whole"),
+        aval)
+    w_run = next((r for r in rect2.text_frame.paragraphs[0].runs if "Участник" in r.text),
+                 None)
+    check("review7: autoshape whole uses otherStyle size",
+          (not overflow_at_44) or
+          (any("уменьшен" in n or "не поместился" in n for n in w_note)
+           and w_run is not None and w_run.font.size is not None
+           and w_run.font.size.pt < 44),
+          f"notes={w_note}")
+    style_file = os.path.join(tmp, "styled_shape.pptx")
+    style_deck.save(style_file)
+    reloaded = Presentation(style_file).slides[0]
+    reloaded_run = next(r for s in reloaded.shapes if s.has_text_frame
+                        for r in s.text_frame.paragraphs[0].runs
+                        if "Участник" in r.text)
+    check("review7: autoshape size survives save/reopen",
+          reloaded_run.font.size is not None
+          and reloaded_run.font.size.pt < 44 or not overflow_at_44,
+          str(reloaded_run.font.size))
+
+    # ---- anonymized end-to-end fixture: 6 rows -> combined deck ---------
+    fixture_pptx = os.path.join(tmp, "fixture_template.pptx")
+    fixture_xlsx = os.path.join(tmp, "fixture_list.xlsx")
+    fdeck = Presentation()
+    fdeck.slide_width = Cm(28)
+    fdeck.slide_height = Cm(20)
+    fslide = fdeck.slides.add_slide(fdeck.slide_layouts[6])
+    fio_box = fslide.shapes.add_textbox(Cm(1), Cm(2), Cm(9), Cm(1.5))
+    fio_box.text_frame.word_wrap = False
+    fio_par = fio_box.text_frame.paragraphs[0]
+    fio_par.font.size = Pt(40)
+    fio_par.font.name = "Arial"
+    fio_par.add_run().text = "@@FIO@@"
+    nom_box = fslide.shapes.add_textbox(Cm(1), Cm(6), Cm(18), Cm(2))
+    nom_box.text_frame.text = "Номинация: «Тестовая номинация»"
+    dep_box = fslide.shapes.add_textbox(Cm(1), Cm(10), Cm(18), Cm(2))
+    dep_box.text_frame.text = "Тестовое управление"
+    fdeck.save(fixture_pptx)
+    fbook = openpyxl.Workbook()
+    fsheet = fbook.active
+    fsheet.append(["ФИО", "Номинация", "Управление"])
+    anon_rows = [[f"Участник {ch}", f"Тестовая номинация {i}", f"Тестовое управление {i}"]
+                 for i, ch in enumerate("АБВГД", 1)]
+    anon_rows.append(["Участник Е С Очень Длинной Фамилией Для Проверки Автоподбора Шрифта",
+                      "Тестовая номинация 6", "Тестовое управление 6"])
+    for row in anon_rows:
+        fsheet.append(row)
+    fbook.save(fixture_xlsx)
+    fbook.close()
+
+    th, xh = _sha(fixture_pptx), _sha(fixture_xlsx)
+    rh, rr = excel_reader.read_xlsx(fixture_xlsx)
+    real_blocks = {b["shape_id"]: b for b in pptx_engine.list_text_shapes(Presentation(fixture_pptx))}
+    nom_id = next(sid for sid, b in real_blocks.items() if "Номинация:" in b["text"])
+    dep_id = next(sid for sid, b in real_blocks.items() if "Тестовое управление" in b["text"])
+    fio_id = next(sid for sid, b in real_blocks.items() if "@@FIO@@" in b["text"])
+    field_map = [
+        Field("ФИО", [PptxPlacement(0, fio_id, real_blocks[fio_id]["text"], "@@FIO@@",
+                                   "token")], required=True),
+        Field("Номинация", [PptxPlacement(0, nom_id, real_blocks[nom_id]["text"],
+                                         "Тестовая номинация", "fragment")], required=True),
+        Field("Управление", [PptxPlacement(0, dep_id, real_blocks[dep_id]["text"], "",
+                                          "whole")], required=True),
+    ]
+    real_out = os.path.join(tmp, "real")
+    real_rep = generate(fixture_pptx, TEMPLATE_PPTX, field_map,
+                        {name: rh.index(name) for name in ("ФИО", "Номинация", "Управление")},
+                        rr, real_out, MODE_COMBINED, rh.index("ФИО"))
+    real_result = Presentation(os.path.join(real_out, real_rep["created"][0][1]))
+    text_rows = [[s.text_frame.text for s in slide.shapes if s.has_text_frame]
+                 for slide in real_result.slides]
+    check("iter6: workbook six slides in row order", len(text_rows) == 6 and all(
+          all(rr[i][rh.index(name)] in " ".join(text_rows[i])
+              for name in ("ФИО", "Номинация", "Управление"))
+          for i in range(6)))
+    check("iter6: nomination surrounds preserved", all(
+          f"Номинация: «{rr[i][rh.index('Номинация')]}»" in text_rows[i]
+          for i in range(6)))
+    check("iter6: long name explicitly reviewed", any(
+          row == 7 and any("шрифт" in note or "не поместился" in note for note in notes)
+          for row, notes in real_rep["review"]))
+    check("iter6: original template and Excel unchanged",
+          th == _sha(fixture_pptx) and xh == _sha(fixture_xlsx))
 
     # ---- perf: 150 rows -------------------------------------------------------
     big_rows = [[f"{n} Тестович{i}", REGIONS[i % len(REGIONS)]]

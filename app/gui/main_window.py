@@ -46,6 +46,10 @@ class MainWindow(QMainWindow):
         if idx == 2:
             self.step3.on_enter()
 
+    def closeEvent(self, event):
+        self.step3.stop_worker()
+        super().closeEvent(event)
+
     def _restart(self):
         self.state.excel_path = None
         self.state.headers = []

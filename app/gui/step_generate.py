@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import os
 
 from PySide6.QtCore import QThread, QUrl, Signal
@@ -12,7 +13,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from app.core import excel_reader
+from app.core import excel_reader, pptx_engine
+from app.core.models import TEMPLATE_PPTX
 from app.core.generator import (
     EXISTS_OVERWRITE, EXISTS_SKIP, EXISTS_SUFFIX,
     MODE_COMBINED, MODE_SEPARATE, generate, planned_filenames,
@@ -51,7 +53,7 @@ class ModeDialog(QDialog):
         v.addWidget(QLabel("Как сохранить результаты?"))
         self.rb_sep = QRadioButton("Отдельный файл на каждую строку")
         self.rb_comb = QRadioButton("Один файл со всеми записями")
-        self.rb_sep.setChecked(True)
+        self.rb_comb.setChecked(True)
         v.addWidget(self.rb_sep)
         v.addWidget(self.rb_comb)
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -76,7 +78,7 @@ class ExistsDialog(QDialog):
             "Что сделать со всеми совпадениями?"))
         self.rb_over = QRadioButton("Перезаписать все")
         self.rb_skip = QRadioButton("Пропустить существующие (создать только новые)")
-        self.rb_suf = QRadioButton("Добавить суффикс «_new» к именам")
+        self.rb_suf = QRadioButton("Добавить суффикс «_2», «_3» к именам")
         self.rb_suf.setChecked(True)
         v.addWidget(self.rb_over)
         v.addWidget(self.rb_skip)
@@ -105,10 +107,10 @@ class StepGenerate(QWidget):
 
         root = QVBoxLayout(self)
         top = QHBoxLayout()
-        btn = QPushButton("Выбрать папку для результатов…")
-        btn.clicked.connect(self._pick_dir)
+        self.btn_dir = QPushButton("Выбрать папку для результатов…")
+        self.btn_dir.clicked.connect(self._pick_dir)
         self.lbl_dir = QLabel("Папка не выбрана")
-        top.addWidget(btn)
+        top.addWidget(self.btn_dir)
         top.addWidget(self.lbl_dir, 1)
         root.addLayout(top)
 
@@ -164,12 +166,24 @@ class StepGenerate(QWidget):
             self.lbl_dir.setText(d)
 
     def _start(self):
+        if self._worker is not None:
+            return
         if not self.state.out_dir:
             QMessageBox.warning(self, "Папка", "Выберите папку для результатов.")
             return
         if not self.state.template_path or not self.state.rows:
             QMessageBox.warning(self, "Данные", "Нужны шаблон и Excel-файл.")
             return
+        if self.state.template_type == TEMPLATE_PPTX:
+            try:
+                issues = pptx_engine.required_placement_issues(
+                    pptx_engine.open_template(self.state.template_path),
+                    self.state.fields, self.state.slide_sel)
+            except Exception as exc:
+                issues = [f"Не удалось проверить шаблон: {exc}"]
+            if issues:
+                QMessageBox.warning(self, "Привязки", "\n".join(issues))
+                return
 
         dlg = ModeDialog(self)
         if dlg.exec() != QDialog.Accepted:
@@ -177,9 +191,22 @@ class StepGenerate(QWidget):
         mode = dlg.mode
 
         # pre-generation validation
-        cols = list(self.state.colmap.values())
+        cols = [self.state.colmap[f.name] for f in self.state.fields
+                if f.required and f.source == "column" and f.name in self.state.colmap]
         problems = excel_reader.validate_rows(
-            self.state.rows, cols, self.state.filename_col, self.state.headers)
+            self.state.rows, cols,
+            self.state.filename_col if mode == MODE_SEPARATE else None,
+            self.state.headers)
+        problems.extend((0, f"обязательное поле «{f.name}» не заполнено")
+                        for f in self.state.fields if f.required and
+                        (f.source == "keep" or
+                         f.source == "column" and f.name not in self.state.colmap or
+                         f.source == "constant" and not f.constant.strip()))
+        columns = [p for r, p in problems if r == 0]
+        if columns:
+            QMessageBox.warning(self, "Проверка данных",
+                                "Исправьте ошибки перед генерацией:\n" + "\n".join(columns))
+            return
         skip: set[int] = set()
         if problems:
             preview = "\n".join(
@@ -201,9 +228,11 @@ class StepGenerate(QWidget):
         planned = planned_filenames(
             self.state.template_path, self.state.template_type,
             self.state.rows, mode, self.state.filename_col, skip,
-            first_word=self.state.filename_first_word)
-        existing = [n for n in planned
-                    if os.path.exists(os.path.join(self.state.out_dir, n))]
+            first_word=self.state.filename_first_word,
+            out_dir=self.state.out_dir)
+        on_disk = ({n.casefold() for n in os.listdir(self.state.out_dir)}
+                   if os.path.isdir(self.state.out_dir) else set())
+        existing = [n for n in planned if n.casefold() in on_disk]
         exists_mode = EXISTS_OVERWRITE
         if existing:
             dlg2 = ExistsDialog(len(existing), self)
@@ -212,6 +241,9 @@ class StepGenerate(QWidget):
             exists_mode = dlg2.exists_mode
 
         self.btn_start.setEnabled(False)
+        self.btn_back.setEnabled(False)
+        self.btn_restart.setEnabled(False)
+        self.btn_dir.setEnabled(False)
         self.btn_cancel.setEnabled(True)
         self.txt_log.clear()
         self.progress.setMaximum(len(self.state.rows))
@@ -229,10 +261,12 @@ class StepGenerate(QWidget):
             skip_rows=skip,
             exists_mode=exists_mode,
             first_word=self.state.filename_first_word,
+            slide_sel=self.state.slide_sel,
         )
-        self._worker = _Worker(kwargs)
+        self._worker = _Worker(copy.deepcopy(kwargs))
         self._worker.sig_progress.connect(self._on_progress)
         self._worker.sig_done.connect(self._on_done)
+        self._worker.finished.connect(self._worker_finished)
         self._worker.start()
 
     def _cancel(self):
@@ -247,14 +281,18 @@ class StepGenerate(QWidget):
 
     def _on_done(self, rep: dict):
         self.btn_start.setEnabled(True)
+        self.btn_back.setEnabled(True)
+        self.btn_restart.setEnabled(True)
+        self.btn_dir.setEnabled(True)
         self.btn_cancel.setEnabled(False)
-        self.progress.setValue(self.progress.maximum())
-        self.btn_open_dir.setEnabled(True)
+        self.btn_open_dir.setEnabled(bool(rep.get("created")))
 
         lines = []
         if rep.get("fatal"):
             lines.append(f"Критическая ошибка: {rep['fatal']}")
-        lines.append(f"Создано записей: {len(rep['created'])}")
+        lines.append(f"Обработано: {self.progress.value()} из {len(self.state.rows)}")
+        lines.append(f"Сохранено записей: {len(rep['created'])}")
+        lines.append(f"Папка результатов: {self.state.out_dir}")
         if rep["cancelled"]:
             lines.append("Генерация была отменена пользователем.")
         if rep["skipped"]:
@@ -272,8 +310,21 @@ class StepGenerate(QWidget):
             lines.append(f"Отчёт сохранён: {rep['report_path']}")
         text = "\n".join(lines)
         self.txt_log.setPlainText(text)
-        self.lbl_status.setText("Готово")
+        self.lbl_status.setText("Отменено" if rep["cancelled"] else
+                                "Завершено с ошибками" if rep.get("fatal") or
+                                (rep["skipped"] and not rep["created"]) else "Готово")
         QMessageBox.information(self, "Генерация завершена", text[:3000])
+
+    def _worker_finished(self):
+        worker = self._worker
+        if worker:
+            worker.wait()
+            self._worker = None
+
+    def stop_worker(self):
+        if self._worker and self._worker.isRunning():
+            self._worker.cancel()
+            self._worker.wait()
 
     def _open_dir(self):
         if self.state.out_dir:

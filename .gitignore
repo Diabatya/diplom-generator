@@ -6,3 +6,4 @@ dist_*/
 __pycache__/
 *.mapping.json
 testdata/
+selftest_result.log

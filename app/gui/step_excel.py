@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 import tempfile
 
+import openpyxl
+
 try:
     import pymupdf as fitz_mod
 except ImportError:
@@ -13,7 +15,7 @@ from PySide6.QtCore import QUrl, Qt
 from PySide6.QtGui import QDesktopServices, QImage, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
-    QGroupBox, QHBoxLayout, QLabel, QMessageBox, QPlainTextEdit,
+    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
     QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -70,7 +72,10 @@ class StepExcel(QWidget):
         self._go_next = go_next
         self._go_back = go_back
         self._combos: dict[str, QComboBox] = {}
+        self._constants = {}
         self._sheets: list[str] = []
+        self._colmap_titles: dict[str, str] = {}
+        self._name_col_title = None
 
         root = QVBoxLayout(self)
         top = QHBoxLayout()
@@ -81,6 +86,9 @@ class StepExcel(QWidget):
         self.cmb_sheet.setVisible(False)
         self.cmb_sheet.currentIndexChanged.connect(self._sheet_changed)
         top.addWidget(btn)
+        btn_template = QPushButton("Сохранить пустой Excel…")
+        btn_template.clicked.connect(self._save_blank_excel)
+        top.addWidget(btn_template)
         top.addWidget(self.lbl_file, 1)
         top.addWidget(QLabel("Лист:"))
         top.addWidget(self.cmb_sheet)
@@ -114,7 +122,8 @@ class StepExcel(QWidget):
         root.addWidget(self.txt_issues)
 
         row = QHBoxLayout()
-        self.btn_sample = QPushButton("Сгенерировать пример (по первой строке)")
+        self.cmb_sample = QComboBox()
+        self.btn_sample = QPushButton("Сгенерировать пример выбранной строки")
         self.btn_sample.clicked.connect(self._sample)
         self.btn_back = QPushButton("← Назад")
         self.btn_back.clicked.connect(self._go_back)
@@ -122,11 +131,29 @@ class StepExcel(QWidget):
         self.btn_next.clicked.connect(self._next)
         row.addWidget(self.btn_back)
         row.addStretch(1)
+        row.addWidget(self.cmb_sample)
         row.addWidget(self.btn_sample)
         row.addWidget(self.btn_next)
         root.addLayout(row)
 
-    # ---- excel -----------------------------------------------------------
+    def _save_blank_excel(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Сохранить пустой Excel", "participants-template.xlsx", "Excel (*.xlsx)")
+        if not path:
+            return
+        if not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Участники"
+        ws.append(["ФИО", "Номинация", "Управление"])
+        try:
+            wb.save(path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Excel", f"Не удалось сохранить файл:\n{exc}")
+        finally:
+            wb.close()
+
     def _open_excel(self):
         path, _ = QFileDialog.getOpenFileName(self, "Список Excel", "", "Excel (*.xlsx)")
         if not path:
@@ -137,6 +164,14 @@ class StepExcel(QWidget):
             QMessageBox.critical(self, "Excel", f"Не удалось прочитать файл:\n{exc}")
             return
         self._sheets = sheets
+        if self.state.excel_path != path:
+            self.state.colmap = {}
+            self.state.filename_source = ("auto", None)
+            self.state.headers = []
+            self.state.rows = []
+            self.state.sheet_name = None
+            self._colmap_titles = {}
+            self._name_col_title = None
         self.state.excel_path = path
         self.cmb_sheet.blockSignals(True)
         self.cmb_sheet.clear()
@@ -149,23 +184,65 @@ class StepExcel(QWidget):
         if 0 <= idx < len(self._sheets):
             self._load_sheet(self._sheets[idx])
 
+    def _clear_sheet(self, sheet_name: str, headers=None):
+        if self.state.rows:
+            # Preserve the mapping by column title — indices into the old
+            # header list are meaningless once a different schema is shown.
+            self._colmap_titles = {name: self.state.headers[i]
+                                   for name, i in self.state.colmap.items()
+                                   if 0 <= i < len(self.state.headers)}
+            kind, val = self.state.filename_source
+            if kind == "col" and 0 <= val < len(self.state.headers):
+                self._name_col_title = self.state.headers[val]
+        self.state.sheet_name = sheet_name
+        self.state.headers = headers or []
+        self.state.rows = []
+        self.table.clear()
+        self.table.setRowCount(0)
+        self.table.setColumnCount(0)
+        self.cmb_sample.clear()
+        self.btn_next.setEnabled(False)
+        self.btn_sample.setEnabled(False)
+        self.lbl_file.setText(f"{os.path.basename(self.state.excel_path)} — 0 строк")
+        self.txt_issues.setPlainText("Excel-файл пуст: заполните строки участников.")
+
     def _load_sheet(self, sheet_name: str):
         try:
             headers, rows = excel_reader.read_xlsx(self.state.excel_path, sheet_name)
         except Exception as exc:
+            self._clear_sheet(sheet_name)
             QMessageBox.critical(self, "Excel", f"Не удалось прочитать лист:\n{exc}")
             return
         if not headers or not rows:
+            self._clear_sheet(sheet_name, headers)
             QMessageBox.warning(self, "Excel", "Лист пуст или нет данных после строки заголовков.")
             return
+        if self._colmap_titles:
+            previous = self._colmap_titles
+            self._colmap_titles = {}
+        else:
+            previous = {name: self.state.headers[i]
+                        for name, i in self.state.colmap.items()
+                        if 0 <= i < len(self.state.headers)}
+        self.state.colmap = {name: headers.index(title) for name, title in previous.items()
+                             if title in headers}
         self.state.sheet_name = sheet_name
         self.state.headers = headers
         self.state.rows = rows
+        self.btn_next.setEnabled(True)
+        self.btn_sample.setEnabled(True)
         self.lbl_file.setText(
             f"{os.path.basename(self.state.excel_path)} — {len(rows)} строк(и)")
         self._fill_table()
         self._build_mapping()
         self._revalidate()
+        self.cmb_sample.clear()
+        longest = max(range(len(rows)), key=lambda i: sum(len(v) for v in rows[i]))
+        for i, row in enumerate(rows):
+            label = f"Excel строка {i + 2}"
+            if i == longest:
+                label += " (длинные значения)"
+            self.cmb_sample.addItem(label, i)
 
     def _fill_table(self):
         h, rows = self.state.headers, self.state.rows
@@ -181,17 +258,38 @@ class StepExcel(QWidget):
         while self.map_layout.rowCount():
             self.map_layout.removeRow(0)
         self._combos = {}
+        self._constants = {}
         for f in self.state.fields:
             cmb = QComboBox()
-            cmb.addItem("— не выбрано —", -1)
-            pre = self._guess_column(f.name)
+            cmb.addItem("Сохранить исходный текст", -1)
+            cmb.addItem("Постоянный текст", -2)
             for i, htext in enumerate(self.state.headers):
                 cmb.addItem(htext, i)
-            if pre >= 0:
-                cmb.setCurrentIndex(pre + 1)
+            pre = self.state.colmap.get(f.name, self._guess_column(f.name))
+            if f.source == "keep":
+                cmb.setCurrentIndex(0)
+            elif f.source == "constant":
+                cmb.setCurrentIndex(1)
+            elif pre >= 0 and pre < len(self.state.headers):
+                cmb.setCurrentIndex(pre + 2)
+            constant = QLineEdit(f.constant)
+            constant.setPlaceholderText("Текст для всех дипломов")
+            constant.setVisible(cmb.currentData() == -2)
+            constant.textChanged.connect(lambda text, field=f: self._constant_changed(field, text))
+            required = QCheckBox("Обязательно")
+            required.setChecked(f.required or f.name.casefold() == "фио")
+            required.toggled.connect(lambda checked, field=f: self._required_changed(field, checked))
+            row = QWidget()
+            layout = QHBoxLayout(row)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.addWidget(cmb, 2)
+            layout.addWidget(constant, 2)
+            layout.addWidget(required)
             cmb.currentIndexChanged.connect(lambda _i, name=f.name: self._map_changed(name))
             self._combos[f.name] = cmb
-            self.map_layout.addRow(f.name, cmb)
+            self._constants[f.name] = constant
+            self.map_layout.addRow(f.name, row)
+            f.required = required.isChecked()
         for f in self.state.fields:
             self._map_changed(f.name)
         self._build_name_combo()
@@ -204,9 +302,20 @@ class StepExcel(QWidget):
                 return i
         return -1
 
+    def _constant_changed(self, field, text):
+        field.constant = text
+        self._revalidate()
+
+    def _required_changed(self, field, checked):
+        field.required = checked
+        self._revalidate()
+
     def _map_changed(self, name: str):
         cmb = self._combos[name]
         col = cmb.currentData()
+        field = next(f for f in self.state.fields if f.name == name)
+        field.source = "keep" if col == -1 else "constant" if col == -2 else "column"
+        self._constants[name].setVisible(col == -2)
         if col is not None and col >= 0:
             self.state.colmap[name] = col
         else:
@@ -219,6 +328,11 @@ class StepExcel(QWidget):
         """Populate the 'field for file name' combo: template fields first,
         then raw Excel columns. Keeps the previous choice when possible."""
         prev = self.state.filename_source
+        if self._name_col_title is not None:
+            if self._name_col_title in self.state.headers:
+                prev = ("col", self.state.headers.index(self._name_col_title))
+                self.state.filename_source = prev
+            self._name_col_title = None
         self.cmb_name.blockSignals(True)
         self.cmb_name.clear()
         default_idx = choose_filename_field(self.state.fields) if self.state.fields else -1
@@ -278,19 +392,26 @@ class StepExcel(QWidget):
     def current_problems(self) -> list[tuple[int, str]]:
         if not self.state.rows:
             return []
-        cols = list(self.state.colmap.values())
-        return excel_reader.validate_rows(
-            self.state.rows, cols, self._filename_col(), self.state.headers)
+        cols = [self.state.colmap[f.name] for f in self.state.fields
+                if f.required and f.source == "column" and f.name in self.state.colmap]
+        problems = excel_reader.validate_rows(
+            self.state.rows, cols, None, self.state.headers)
+        for f in self.state.fields:
+            if f.required and (f.source == "keep" or
+                               f.source == "column" and f.name not in self.state.colmap or
+                               f.source == "constant" and not f.constant.strip()):
+                problems.append((0, f"обязательное поле «{f.name}» не заполнено"))
+        return problems
 
     def _revalidate(self):
         problems = self.current_problems()
         if not self.state.rows:
             self.txt_issues.setPlainText("Excel-файл не загружен.")
             return
-        unmapped = [f.name for f in self.state.fields if f.name not in self.state.colmap]
+        kept = [f.name for f in self.state.fields if f.source == "keep"]
         lines = []
-        if unmapped:
-            lines.append("Поля без столбца (подставятся пустыми): " + ", ".join(unmapped))
+        if kept:
+            lines.append("Сохранён исходный текст шаблона: " + ", ".join(kept))
         if problems:
             lines.append(f"Найдено проблем: {len(problems)}")
             for row_no, prob in problems[:200]:
@@ -308,10 +429,15 @@ class StepExcel(QWidget):
             QMessageBox.warning(self, "Пример", "Нужны шаблон и Excel-файл.")
             return
         problems = self.current_problems()
-        bad = {r for r, _p in problems if r}
-        idx = next((i for i in range(len(self.state.rows)) if i + 2 not in bad), None)
+        if any(r == 0 for r, _ in problems):
+            QMessageBox.warning(self, "Пример", "Исправьте ошибки столбцов и обязательных полей.")
+            return
+        idx = self.cmb_sample.currentData()
         if idx is None:
-            QMessageBox.warning(self, "Пример", "Нет ни одной валидной строки.")
+            return
+        row_problems = [p for r, p in problems if r == idx + 2]
+        if row_problems:
+            QMessageBox.warning(self, "Пример", "Строка содержит ошибки: " + "; ".join(row_problems))
             return
         tmpdir = tempfile.mkdtemp(prefix="diplom_sample_")
         try:
@@ -320,6 +446,7 @@ class StepExcel(QWidget):
                 self.state.colmap, [self.state.rows[idx]], tmpdir, MODE_SEPARATE,
                 self._filename_col(), set(),
                 first_word=self.state.filename_first_word,
+                slide_sel=self.state.slide_sel,
             )
         except Exception as exc:
             QMessageBox.critical(self, "Пример", f"Ошибка генерации:\n{exc}")
@@ -356,6 +483,7 @@ class StepExcel(QWidget):
                     self.state.fields,
                     filename_source=self.state.filename_source,
                     filename_first_word=self.state.filename_first_word,
+                    slide_sel=self.state.slide_sel,
                 )
             except Exception:
                 pass

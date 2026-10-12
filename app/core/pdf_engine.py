@@ -127,7 +127,9 @@ def _apply_placements(doc: fitz.Document, fields: list[Field], values: dict[str,
     notes: list[str] = []
     per_page: dict[int, list[tuple[Field, PdfPlacement, str]]] = {}
     for f in fields:
-        value = values.get(f.name, "")
+        if f.name not in values:
+            continue
+        value = values[f.name]
         for pl in f.placements:
             if isinstance(pl, PdfPlacement):
                 per_page.setdefault(pl.page, []).append((f, pl, value))
@@ -151,7 +153,7 @@ def _apply_placements(doc: fitz.Document, fields: list[Field], values: dict[str,
             else:
                 fill = _sample_fill(page, rect)
                 if fill_risk_on_page(page, rect):
-                    notes.append(f"{_f.name}: {_FILL_RISK_NOTE}")
+                    notes.append(f"{_f.name}, страница {page_no + 1}: {_FILL_RISK_NOTE}")
             page.add_redact_annot(rect, fill=fill)
         page.apply_redactions(
             images=fitz.PDF_REDACT_IMAGE_NONE,
@@ -183,10 +185,10 @@ def _apply_placements(doc: fitz.Document, fields: list[Field], values: dict[str,
             page.insert_text(fitz.Point(x, baseline_y), value, **kwargs)
             if not fits:
                 notes.append(
-                    f"{f.name}: текст не поместился даже при минимальном размере ({size:.1f} pt)"
+                    f"{f.name}, страница {page_no + 1}: текст не поместился даже при минимальном размере ({size:.1f} pt)"
                 )
             elif size < pl.font_size:
-                notes.append(f"{f.name}: шрифт уменьшен до {size:.1f} pt")
+                notes.append(f"{f.name}, страница {page_no + 1}: шрифт уменьшен до {size:.1f} pt")
     return notes
 
 

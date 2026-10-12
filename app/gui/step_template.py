@@ -118,6 +118,12 @@ class StepTemplate(QWidget):
         top.addWidget(self.btn_open)
         top.addWidget(self.lbl_template, 1)
         root.addLayout(top)
+        self.lbl_preview = QLabel("PPTX: предпросмотр приблизительный — точный вид проверьте в PowerPoint.")
+        root.addWidget(self.lbl_preview)
+        self.cmb_slide = QComboBox()
+        self.cmb_slide.setVisible(False)
+        self.cmb_slide.currentIndexChanged.connect(self._slide_choice_changed)
+        root.addWidget(self.cmb_slide)
 
         split = QSplitter(Qt.Horizontal)
 
@@ -275,6 +281,10 @@ class StepTemplate(QWidget):
 
         self.state.template_path = path
         self.state.fields = []
+        self.state.colmap = {}
+        self.state.filename_source = ("auto", None)
+        self.state.filename_first_word = False
+        self.state.slide_sel = [0] if ext == ".pptx" and self._page_count > 1 else None
         self._page = 0
         self.lbl_template.setText(os.path.basename(path))
         self.btn_save_map.setEnabled(True)
@@ -289,11 +299,25 @@ class StepTemplate(QWidget):
                 try:
                     ttype, fields, extra = mapping_io.load_mapping(path)
                     if ttype == self.state.template_type:
+                        current = {(b["slide"], b["shape_id"], b.get("cell")): b["text"]
+                                   for b in pptx_engine.list_text_shapes(self._prs)} if self._prs else {}
+                        stale = [f.name for f in fields for pl in f.placements
+                                 if isinstance(pl, PptxPlacement) and
+                                 (current.get((pl.slide, pl.shape_id, pl.cell)) is None or
+                                  pl.pattern and current[(pl.slide, pl.shape_id, pl.cell)] != pl.pattern)]
+                        if stale:
+                            QMessageBox.warning(self, "Разметка",
+                                "Блоки шаблона изменились: " + ", ".join(sorted(set(stale))) +
+                                ". Создайте привязки заново; прежняя разметка не загружена.")
+                            fields = []
                         self.state.fields = fields
-                        if "filename_source" in extra:
-                            self.state.filename_source = tuple(extra["filename_source"])
-                        if "filename_first_word" in extra:
-                            self.state.filename_first_word = extra["filename_first_word"]
+                        if not stale:
+                            if "filename_source" in extra:
+                                self.state.filename_source = tuple(extra["filename_source"])
+                            if "filename_first_word" in extra:
+                                self.state.filename_first_word = extra["filename_first_word"]
+                            if "slide_sel" in extra:
+                                self.state.slide_sel = extra["slide_sel"]
                     else:
                         QMessageBox.warning(self, "Разметка", "Тип шаблона в разметке не совпадает.")
                 except Exception as exc:
@@ -303,7 +327,24 @@ class StepTemplate(QWidget):
         self._set_page(0)
         self._refresh_fields()
 
+    def _slide_choice_changed(self, idx: int):
+        if idx < 0:
+            return
+        choice = self.cmb_slide.itemData(idx)
+        self.state.slide_sel = [choice] if isinstance(choice, int) else None
+
     def _configure_for_type(self):
+        self.cmb_slide.blockSignals(True)
+        self.cmb_slide.clear()
+        show = self.state.template_type == TEMPLATE_PPTX and self._page_count > 1
+        self.cmb_slide.setVisible(show)
+        if show:
+            self.cmb_slide.addItem("Все слайды шаблона на каждую строку", None)
+            for i in range(self._page_count):
+                self.cmb_slide.addItem(f"Только слайд {i + 1} на каждую строку", i)
+            chosen = self.state.slide_sel
+            self.cmb_slide.setCurrentIndex(chosen[0] + 1 if chosen and 0 <= chosen[0] < self._page_count else 0)
+        self.cmb_slide.blockSignals(False)
         is_pdf = self.state.template_type == TEMPLATE_PDF
         self.canvas.set_mode(MODE_DRAW if is_pdf else MODE_PICK)
         self.grp_style.setVisible(is_pdf)
@@ -373,7 +414,7 @@ class StepTemplate(QWidget):
         if any(f.name == name for f in self.state.fields):
             QMessageBox.warning(self, "Поле", "Поле с таким именем уже есть.")
             return
-        self.state.fields.append(Field(name=name))
+        self.state.fields.append(Field(name=name, required=name.casefold() == "фио"))
         self._refresh_fields()
         self.lst_fields.setCurrentRow(len(self.state.fields) - 1)
 
@@ -404,8 +445,10 @@ class StepTemplate(QWidget):
                     mode_lbl = {"whole": "весь текст", "fragment": "фрагмент",
                                 "token": "токен"}.get(pl.mode, pl.mode)
                     extra = f' ({pl.token[:30]})' if pl.mode != "whole" and pl.token else ""
+                    cell_lbl = (f", ячейка {pl.cell[0] + 1}:{pl.cell[1] + 1}"
+                                if pl.cell is not None else "")
                     self.lst_places.addItem(
-                        f"слайд {pl.slide + 1}, блок #{pl.shape_id} — {mode_lbl}{extra}")
+                        f"слайд {pl.slide + 1}, блок #{pl.shape_id}{cell_lbl} — {mode_lbl}{extra}")
                 else:
                     self.lst_places.addItem(
                         f"стр. {pl.page + 1}, рамка "
@@ -415,13 +458,15 @@ class StepTemplate(QWidget):
 
     def _refresh_blocks(self):
         self.lst_blocks.clear()
-        bound = {pl.shape_id for f in self.state.fields for pl in f.placements
-                 if isinstance(pl, PptxPlacement)}
+        bound = {(pl.slide, pl.shape_id, pl.cell) for f in self.state.fields
+                 for pl in f.placements if isinstance(pl, PptxPlacement)}
         for b in self._blocks:
-            mark = " ✓" if b["shape_id"] in bound else ""
+            mark = " ✓" if (self._page, b["shape_id"], b.get("cell")) in bound else ""
             text = b["text"].replace("\n", " ")[:60]
-            item = QListWidgetItem(f"#{b['shape_id']}: {text}{mark}")
-            item.setData(Qt.UserRole, b["shape_id"])
+            cell = b.get("cell")
+            cell_lbl = f" [{cell[0] + 1}:{cell[1] + 1}]" if cell is not None else ""
+            item = QListWidgetItem(f"#{b['shape_id']}{cell_lbl}: {text}{mark}")
+            item.setData(Qt.UserRole, (b["shape_id"], cell))
             self.lst_blocks.addItem(item)
 
     def _on_field_selected(self, _row):
@@ -429,15 +474,17 @@ class StepTemplate(QWidget):
         self._refresh_overlays()
 
     # ---- placement binding ------------------------------------------------
-    def _on_shape_picked(self, shape_id: int):
+    def _on_shape_picked(self, target):
         f = self._cur_field()
         if f is None:
             QMessageBox.information(self, "Поле", "Сначала добавьте и выберите поле в списке справа.")
             return
-        if any(isinstance(p, PptxPlacement) and p.shape_id == shape_id and p.slide == self._page
-               for p in f.placements):
+        shape_id, cell = target
+        if any(isinstance(p, PptxPlacement) and p.shape_id == shape_id
+               and p.cell == cell and p.slide == self._page for p in f.placements):
             return
-        block = next((b for b in self._blocks if b["shape_id"] == shape_id), None)
+        block = next((b for b in self._blocks if b["shape_id"] == shape_id
+                      and b.get("cell") == cell), None)
         pattern = block["text"] if block else ""
         detected = pptx_engine.detect_token(pattern) if pattern else ""
         dlg = BindDialog(pattern, detected, self)
@@ -445,7 +492,7 @@ class StepTemplate(QWidget):
             return
         f.placements.append(PptxPlacement(
             slide=self._page, shape_id=shape_id,
-            pattern=pattern, token=dlg.token, mode=dlg.mode,
+            pattern=pattern, token=dlg.token, mode=dlg.mode, cell=cell,
         ))
         self._refresh_fields_keep_sel()
         self._refresh_blocks()
@@ -498,7 +545,8 @@ class StepTemplate(QWidget):
                 if isinstance(pl, PdfPlacement) and pl.page == self._page:
                     target.append(pl.rect)
                 elif isinstance(pl, PptxPlacement) and pl.slide == self._page:
-                    b = next((b for b in self._blocks if b["shape_id"] == pl.shape_id), None)
+                    b = next((b for b in self._blocks if b["shape_id"] == pl.shape_id
+                              and b.get("cell") == pl.cell), None)
                     if b:
                         target.append((b["left_pt"], b["top_pt"],
                                        b["left_pt"] + b["width_pt"], b["top_pt"] + b["height_pt"]))
@@ -618,6 +666,7 @@ class StepTemplate(QWidget):
                 self.state.template_path, self.state.template_type, self.state.fields,
                 filename_source=self.state.filename_source,
                 filename_first_word=self.state.filename_first_word,
+                slide_sel=self.state.slide_sel,
             )
             QMessageBox.information(self, "Разметка", f"Разметка сохранена:\n{path}")
         except Exception as exc:
@@ -630,6 +679,12 @@ class StepTemplate(QWidget):
         if not self.state.fields:
             QMessageBox.warning(self, "Поля", "Создайте хотя бы одно поле.")
             return
+        if self.state.template_type == TEMPLATE_PPTX:
+            issues = pptx_engine.required_placement_issues(
+                self._prs, self.state.fields, self.state.slide_sel)
+            if issues:
+                QMessageBox.warning(self, "Привязки", "\n".join(issues))
+                return
         empty = [f.name for f in self.state.fields if not f.placements]
         if empty:
             ans = QMessageBox.question(
