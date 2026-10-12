@@ -511,20 +511,26 @@ def main():
           pptx_engine.detect_token("Выдан: @@FIO@@") == "@@FIO@@")
 
     # ---- P2: token twice in one block does not skew autofit -----------------
+    # Deterministic width stub makes the check platform-independent. Literal
+    # runs "№ " + " + " = 5 chars -> 90 pt at 36 pt; box 14 cm minus margins ->
+    # ~382.4 pt. The second occurrence must be measured at the candidate size
+    # like the first (90 + 2*5.5*s <= 382.4 -> s = 26), not at the literal
+    # 36 pt (90 + 5.5*s + 198 -> s = 21, i.e. the old skewed behaviour).
+    from unittest.mock import patch
     dup_pptx = os.path.join(tmp, "dup_tok.pptx")
     prs_d = Presentation()
     prs_d.slide_width = Cm(29.7)
     prs_d.slide_height = Cm(21)
     sld = prs_d.slides.add_slide(prs_d.slide_layouts[6])
-    tbA = sld.shapes.add_textbox(Cm(2), Cm(5), Cm(8), Cm(3))
+    tbA = sld.shapes.add_textbox(Cm(2), Cm(5), Cm(14), Cm(3))
     ra = tbA.text_frame.paragraphs[0].add_run()
     ra.text = "№ @@FIO@@"
     ra.font.size = Pt(36)
-    tbB = sld.shapes.add_textbox(Cm(2), Cm(10), Cm(8), Cm(3))
+    tbB = sld.shapes.add_textbox(Cm(2), Cm(10), Cm(14), Cm(3))
     rb = tbB.text_frame.paragraphs[0].add_run()
     rb.text = "№ @@FIO@@ + @@FIO@@"
     rb.font.size = Pt(36)
-    tbC = sld.shapes.add_textbox(Cm(2), Cm(15), Cm(8), Cm(3))
+    tbC = sld.shapes.add_textbox(Cm(2), Cm(15), Cm(14), Cm(3))
     rc = tbC.text_frame.paragraphs[0].add_run()
     rc.text = "№ @@FIO@@ + "   # same literal text, token only once
     rc.font.size = Pt(36)
@@ -536,10 +542,12 @@ def main():
                                       token="@@FIO@@", mode="fragment")])]
     fldC = [Field("ФИО", [PptxPlacement(0, sidC, pattern="№ @@FIO@@ + ",
                                       token="@@FIO@@", mode="fragment")])]
-    rep_db = generate(dup_pptx, TEMPLATE_PPTX, fldB, {"ФИО": 0}, [[val]],
-                      os.path.join(tmp, "db"), MODE_SEPARATE, 0, set())
-    rep_dc = generate(dup_pptx, TEMPLATE_PPTX, fldC, {"ФИО": 0}, [[val]],
-                      os.path.join(tmp, "dc"), MODE_SEPARATE, 0, set())
+    with patch("app.core.fonts.measure_text_width",
+               new=lambda text, fp, size: len(text) * size * 0.5):
+        rep_db = generate(dup_pptx, TEMPLATE_PPTX, fldB, {"ФИО": 0}, [[val]],
+                          os.path.join(tmp, "db"), MODE_SEPARATE, 0, set())
+        rep_dc = generate(dup_pptx, TEMPLATE_PPTX, fldC, {"ФИО": 0}, [[val]],
+                          os.path.join(tmp, "dc"), MODE_SEPARATE, 0, set())
 
     def value_sizes(path):
         prs = Presentation(path)
@@ -556,7 +564,7 @@ def main():
     szC = value_sizes(os.path.join(tmp, "dc", rep_dc["created"][0][1]))
     check("duptok: both occurrences replaced", len(szB) == 2, str(szB))
     check("duptok: repeated token does not skew autofit",
-          szB and szC and all(abs(s - szC[0]) < 0.01 for s in szB),
+          szB == [26.0, 26.0] and szC == [36.0],
           f"double={szB} single={szC}")
 
     from app.core.generator import MAX_PATH_LEN, plan_batch_names, row_values
