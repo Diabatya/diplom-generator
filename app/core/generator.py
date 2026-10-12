@@ -131,6 +131,12 @@ def _fit_path(out_dir: str, name: str, ext: str, suffix: str = "") -> str | None
         return None
     if len(name) > room:
         name = name[:room].rstrip(" .")
+    if not name:
+        return None
+    if not suffix and name.casefold() in _RESERVED_NAMES:
+        if room < 2:
+            return None
+        name = name[:room - 1].rstrip(" .") + "_"
     return name + suffix + ext
 
 

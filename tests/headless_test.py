@@ -578,6 +578,10 @@ def main():
           and all(len(os.path.join(deep, n)) <= MAX_PATH_LEN for n in long_names), str(long_names))
     impossible = plan_batch_names(["file"], "/" + "a" * MAX_PATH_LEN, ".pptx", EXISTS_SUFFIX)
     check("iter6: impossible path diagnosed", impossible[0][0] is None and bool(impossible[0][1]))
+    tight_dir = "/" + "a" * (MAX_PATH_LEN - 1 - len(".pptx") - 3 - 1)
+    tight_name = plan_batch_names(["CON_"], tight_dir, ".pptx", EXISTS_OVERWRITE)[0][0]
+    check("iter6: truncation cannot revive Windows device name",
+          tight_name is not None and os.path.splitext(tight_name)[0].casefold() != "con", str(tight_name))
 
     decorated = os.path.join(tmp, "decorated.pptx")
     deck = Presentation()
