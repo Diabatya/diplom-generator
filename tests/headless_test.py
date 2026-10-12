@@ -571,6 +571,13 @@ def main():
           and actual[0:3] == ["Иванов.pptx", "Иванов_2.pptx", "Иванов_2_2.pptx"]
           and all(os.path.splitext(n)[0].casefold() not in ("con", "nul", "prn")
                   for n in actual), str(actual))
+    collision_rep = generate(T_PPTX, TEMPLATE_PPTX, fields, cm,
+                             [["Иванов", "X"], ["Иванов", "Y"], ["Иванов_2", "Z"]],
+                             os.path.join(tmp, "batch_collision"), MODE_SEPARATE, 0)
+    check("iter6: batch collision saves three real files", len(collision_rep["created"]) == 3
+          and len({n.casefold() for _, n in collision_rep["created"]}) == 3
+          and all(len(Presentation(os.path.join(collision_rep["out_dir"], n)).slides) == 1
+                  for _, n in collision_rep["created"]))
     deep = os.path.join(tmp, "д" * max(1, MAX_PATH_LEN - len(tmp) - 85))
     long_names = [n for n, _ in plan_batch_names(["Ж" * 80] * 3, deep, ".pptx", EXISTS_OVERWRITE)]
     check("iter6: suffixes survive truncation", len(set(long_names)) == 3
@@ -683,6 +690,17 @@ def main():
                           atom_dir, MODE_COMBINED, 0)
     check("iter6: failed save keeps existing output", not failed["created"] and
           _sha(target) == before_hash and any("no write" in r for _, r in failed["skipped"]))
+    pdf_atom_dir = os.path.join(tmp, "atomic_pdf")
+    pdf_initial = generate(T_PDF, TEMPLATE_PDF, pfields, cm, rows[:1],
+                           pdf_atom_dir, MODE_COMBINED, 0)
+    pdf_target = os.path.join(pdf_atom_dir, pdf_initial["created"][0][1])
+    pdf_hash = _sha(pdf_target)
+    with patch("app.core.generator.os.replace", side_effect=OSError("no write")):
+        pdf_failed = generate(T_PDF, TEMPLATE_PDF, pfields, cm, rows[1:2],
+                              pdf_atom_dir, MODE_COMBINED, 0)
+    check("iter6: failed combined pdf save keeps existing output",
+          not pdf_failed["created"] and _sha(pdf_target) == pdf_hash
+          and any("no write" in reason for _, reason in pdf_failed["skipped"]))
 
     tree = Presentation()
     sl = tree.slides.add_slide(tree.slide_layouts[6])
