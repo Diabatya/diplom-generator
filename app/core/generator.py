@@ -250,6 +250,16 @@ def generate(
         report["skipped"].append((0, "не задано обязательное поле: " + ", ".join(missing)))
         report["report_path"] = _write_report(report, out_dir)
         return report
+    if template_type == TEMPLATE_PPTX:
+        try:
+            issues = pptx_engine.required_placement_issues(
+                pptx_engine.open_template(template_path), fields, slide_sel)
+        except Exception as exc:
+            issues = [f"не удалось проверить шаблон PPTX: {exc}"]
+        if issues:
+            report["skipped"].extend((0, issue) for issue in issues)
+            report["report_path"] = _write_report(report, out_dir)
+            return report
     invalid_rows = {}
     for i, row in enumerate(rows):
         for f in fields:

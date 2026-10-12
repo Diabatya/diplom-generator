@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import re
+from functools import lru_cache
 
 from lxml import etree
 from pptx.oxml.ns import qn
@@ -174,6 +175,34 @@ def _target_frame_and_box(slide, placement: PptxPlacement):
         _shape_text_width_pt(shape) * sx, _shape_text_height_pt(shape) * sy
 
 
+def required_placement_issues(prs: Presentation, fields: list[Field], slide_sel=None) -> list[str]:
+    selected = set(_selected_indexes(prs, slide_sel))
+    issues = []
+    for field in fields:
+        if not field.required:
+            continue
+        valid = False
+        for pl in field.placements:
+            if not isinstance(pl, PptxPlacement) or pl.slide not in selected:
+                continue
+            _shape, tf, _width, _height = _target_frame_and_box(prs.slides[pl.slide], pl)
+            if tf is None:
+                continue
+            if pl.mode in ("fragment", "token"):
+                if not pl.token or not any(
+                    pl.token in "".join(text for _run, text in runs)
+                    for runs in _para_run_elements(tf)
+                ):
+                    continue
+            valid = True
+            break
+        if not valid:
+            slides = ", ".join(str(i + 1) for i in sorted(selected))
+            issues.append(f"обязательное поле «{field.name}»: нет действующей привязки "
+                          f"на выбранных слайдах ({slides}); проверьте блок и фрагмент")
+    return issues
+
+
 def _first_run(tf):
     for para in tf.paragraphs:
         for run in para.runs:
@@ -288,6 +317,71 @@ def _run_font(r_el):
             latin.get("typeface") if latin is not None else None)
 
 
+@lru_cache(maxsize=32)
+def _theme_font(blob: bytes, family: str) -> str | None:
+    root = etree.fromstring(blob)
+    scheme = root.find(".//" + qn("a:fontScheme"))
+    if scheme is None:
+        return None
+    branch = scheme.find(qn("a:majorFont" if family.startswith("+mj-") else "a:minorFont"))
+    if branch is None:
+        return None
+    cyrillic = next((f.get("typeface") for f in branch.findall(qn("a:font"))
+                     if f.get("script") == "Cyrl" and f.get("typeface")), None)
+    latin = branch.find(qn("a:latin"))
+    return cyrillic or (latin.get("typeface") if latin is not None else None)
+
+
+def _effective_run_style(slide, shape, tf, para, r_el):
+    level = min(9, max(1, para.level + 1))
+    candidates = [r_el.find(qn("a:rPr"))]
+    ppr = para._p.find(qn("a:pPr"))
+    candidates.append(ppr.find(qn("a:defRPr")) if ppr is not None else None)
+    body = getattr(tf, "_txBody", None)
+    style = body.find(qn("a:lstStyle")) if body is not None else None
+    lvl = style.find(qn(f"a:lvl{level}pPr")) if style is not None else None
+    candidates.append(lvl.find(qn("a:defRPr")) if lvl is not None else None)
+    layout = slide.slide_layout
+    master = layout.slide_master
+    if shape.is_placeholder:
+        idx = shape.placeholder_format.idx
+        for parent in (layout, master):
+            placeholder = next((s for s in parent.placeholders
+                                if s.placeholder_format.idx == idx), None)
+            if placeholder is not None and placeholder.has_text_frame:
+                p = placeholder.text_frame.paragraphs[0]._p.find(qn("a:pPr"))
+                candidates.append(p.find(qn("a:defRPr")) if p is not None else None)
+                parent_body = placeholder.text_frame._txBody
+                parent_style = parent_body.find(qn("a:lstStyle"))
+                parent_lvl = (parent_style.find(qn(f"a:lvl{level}pPr"))
+                              if parent_style is not None else None)
+                candidates.append(parent_lvl.find(qn("a:defRPr"))
+                                  if parent_lvl is not None else None)
+    tx_styles = master.element.find(qn("p:txStyles"))
+    if tx_styles is not None:
+        type_name = (shape.placeholder_format.type.name if shape.is_placeholder else "")
+        key = "titleStyle" if type_name in ("TITLE", "CENTER_TITLE") else "bodyStyle"
+        branch = tx_styles.find(qn(f"p:{key}"))
+        lvl = branch.find(qn(f"a:lvl{level}pPr")) if branch is not None else None
+        candidates.append(lvl.find(qn("a:defRPr")) if lvl is not None else None)
+    size, family, bold = None, None, None
+    for rpr in candidates:
+        if rpr is None:
+            continue
+        if size is None and rpr.get("sz"):
+            size = int(rpr.get("sz")) / 100.0
+        if bold is None and rpr.get("b") is not None:
+            bold = rpr.get("b") in ("1", "true")
+        latin = rpr.find(qn("a:latin"))
+        if family is None and latin is not None:
+            family = latin.get("typeface")
+    if family and family.startswith(("+mn-", "+mj-")):
+        relation = next((rel for rel in master.part.rels.values()
+                         if rel.reltype == RT.THEME), None)
+        family = _theme_font(relation.target_part.blob, family) if relation else None
+    return size, family, bool(bold)
+
+
 def _set_run_size(r_el, pt: float) -> None:
     rpr = r_el.find(qn("a:rPr"))
     if rpr is None:
@@ -338,7 +432,7 @@ def new_text_for(placement: PptxPlacement, value: str) -> str:
     return value
 
 
-def _est_height_pt(tf, box_w, value_ids=None, vsize=None, vfp=None) -> float:
+def _est_height_pt(tf, box_w, value_ids=None, vsize=None, vfp=None, styles=None) -> float:
     """Estimate line heights with wrapping, run weights and paragraph spacing."""
     total = 0.0
     for para, runs in zip(tf.paragraphs, _para_run_elements(tf)):
@@ -353,17 +447,15 @@ def _est_height_pt(tf, box_w, value_ids=None, vsize=None, vfp=None) -> float:
             para.space_after.pt if para.space_after else 0)
         any_text = False
         for r_el, text in runs:
-            sz, name = _run_font(r_el)
+            sz, name, bold = styles[r_el] if styles else (*_run_font(r_el), False)
             fp = fontlib.find_font_file(name or "")
-            if value_ids and id(r_el) in value_ids:
+            if value_ids and r_el in value_ids:
                 sz, fp = vsize, vfp
             sz = sz or 18.0
             for word in re.split(r"(\s+)", text):
                 if not word:
                     continue
                 any_text = True
-                rpr = r_el.find(qn("a:rPr"))
-                bold = rpr is not None and rpr.get("b") == "1"
                 w = fontlib.measure_text_width(word, fp, sz) * (1.06 if bold else 1.0)
                 if tf.word_wrap and line_w + w > box_w and line_w > 0:
                     total += advance(line_fp, line_sz or 18.0)
@@ -460,14 +552,15 @@ def apply_field_to_slide(slide, placement: PptxPlacement, value: str):
         # fragment mode: shrink value runs until the composed block fits
         # both width and height. Other value runs (the same token repeated)
         # are fully replaced text — not "surrounding" width.
-        value_ids = {id(r) for r in value_run_els}
-        orig_size, fname = 18.0, None
-        for r_el in value_run_els:
-            if r_el is value_run_els[0]:
-                sz, fname = _run_font(r_el)
-                orig_size = sz or orig_size
+        value_ids = set(value_run_els)
+        styles = {r_el: _effective_run_style(slide, shape, tf, para, r_el)
+                  for para in tf.paragraphs for r_el in para._p.findall(qn("a:r"))}
+        measured_size, fname, _bold = styles[value_run_els[0]]
+        orig_size = measured_size or 18.0
         font_path = fontlib.find_font_file(fname or "")
-        if fname and not font_path:
+        if measured_size is None or not fname:
+            notes.append("размер или гарнитура шрифта не определены — расчёт приблизительный")
+        elif not font_path:
             notes.append(f"шрифт «{fname}» не найден в системе — "
                          "расчёт автоподбора приблизительный")
         size = orig_size
@@ -477,13 +570,12 @@ def apply_field_to_slide(slide, placement: PptxPlacement, value: str):
             for runs in _para_run_elements(tf):
                 widths = []
                 for r_el, text in runs:
-                    sz, name = _run_font(r_el)
-                    if id(r_el) in value_ids:
+                    sz, name, bold = styles[r_el]
+                    if r_el in value_ids:
                         sz, fp = s, font_path
                     else:
                         sz, fp = sz or 18.0, fontlib.find_font_file(name or "")
-                    bold = r_el.find(qn("a:rPr"))
-                    weight = 1.06 if bold is not None and bold.get("b") in ("1", "true") else 1.0
+                    weight = 1.06 if bold else 1.0
                     widths.append(fontlib.measure_text_width(text, fp, sz) * weight)
                     if tf.word_wrap and any(fontlib.measure_text_width(word, fp, sz) * weight > box_w
                                             for word in text.split()):
@@ -491,7 +583,7 @@ def apply_field_to_slide(slide, placement: PptxPlacement, value: str):
                 if not tf.word_wrap and sum(widths) > box_w:
                     return False
             return box_h <= 0 or _est_height_pt(
-                tf, box_w, value_ids, s, font_path) <= box_h + 0.5
+                tf, box_w, value_ids, s, font_path, styles) <= box_h + 0.5
 
         while size > min_size and not fits(size):
             size -= 1.0 if size > 12 else 0.5
@@ -506,15 +598,18 @@ def apply_field_to_slide(slide, placement: PptxPlacement, value: str):
 
     run = fallback_run
     new_text = tf.text
-    orig_size = _effective_size_pt(tf, run)
-    font_path = fontlib.find_font_file(run.font.name or "")
-    if run.font.name and not font_path:
-        notes.append(f"шрифт «{run.font.name}» не найден в системе — "
+    para = next((p for p in tf.paragraphs if run._r.getparent() is p._p), tf.paragraphs[0])
+    measured_size, fname, bold = _effective_run_style(slide, shape, tf, para, run._r)
+    orig_size = measured_size or 18.0
+    font_path = fontlib.find_font_file(fname or "")
+    if measured_size is None or not fname:
+        notes.append("размер или гарнитура шрифта не определены — расчёт приблизительный")
+    elif not font_path:
+        notes.append(f"шрифт «{fname}» не найден в системе — "
                      "расчёт автоподбора приблизительный")
     allow_wrap = bool(tf.word_wrap)
     new_size, fits = _fit_block(
-        new_text, font_path, box_w, box_h, orig_size, allow_wrap, tf,
-        bool(run.font.bold))
+        new_text, font_path, box_w, box_h, orig_size, allow_wrap, tf, bold)
     if new_size < orig_size:
         run.font.size = Pt(new_size)
     if not fits:
@@ -592,6 +687,17 @@ def duplicate_slide(prs: Presentation, slide):
     background — solid fill, gradient or picture) to ``prs``."""
     layout = slide.slide_layout
     new_slide = prs.slides.add_slide(layout)
+    for attr in ("showMasterSp", "showMasterPhAnim", "show"):
+        if attr in slide.element.attrib:
+            new_slide.element.set(attr, slide.element.get(attr))
+        else:
+            new_slide.element.attrib.pop(attr, None)
+    src_color = slide.element.find(qn("p:clrMapOvr"))
+    dst_color = new_slide.element.find(qn("p:clrMapOvr"))
+    if dst_color is not None:
+        new_slide.element.remove(dst_color)
+    if src_color is not None:
+        new_slide.element.insert(1, copy.deepcopy(src_color))
     for shp in list(new_slide.shapes):
         shp.element.getparent().remove(shp.element)
 

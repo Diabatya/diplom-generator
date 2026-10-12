@@ -180,18 +180,28 @@ class StepExcel(QWidget):
         if 0 <= idx < len(self._sheets):
             self._load_sheet(self._sheets[idx])
 
+    def _clear_sheet(self, sheet_name: str, headers=None):
+        self.state.sheet_name = sheet_name
+        self.state.headers = headers or []
+        self.state.rows = []
+        self.table.clear()
+        self.table.setRowCount(0)
+        self.table.setColumnCount(0)
+        self.cmb_sample.clear()
+        self.btn_next.setEnabled(False)
+        self.btn_sample.setEnabled(False)
+        self.lbl_file.setText(f"{os.path.basename(self.state.excel_path)} — 0 строк")
+        self.txt_issues.setPlainText("Excel-файл пуст: заполните строки участников.")
+
     def _load_sheet(self, sheet_name: str):
         try:
             headers, rows = excel_reader.read_xlsx(self.state.excel_path, sheet_name)
         except Exception as exc:
+            self._clear_sheet(sheet_name)
             QMessageBox.critical(self, "Excel", f"Не удалось прочитать лист:\n{exc}")
             return
         if not headers or not rows:
-            self.table.clear()
-            self.table.setRowCount(0)
-            self.table.setColumnCount(0)
-            self.cmb_sample.clear()
-            self.txt_issues.setPlainText("Excel-файл пуст: заполните строки участников.")
+            self._clear_sheet(sheet_name, headers)
             QMessageBox.warning(self, "Excel", "Лист пуст или нет данных после строки заголовков.")
             return
         previous = {name: self.state.headers[i] for name, i in self.state.colmap.items()
@@ -201,6 +211,8 @@ class StepExcel(QWidget):
         self.state.sheet_name = sheet_name
         self.state.headers = headers
         self.state.rows = rows
+        self.btn_next.setEnabled(True)
+        self.btn_sample.setEnabled(True)
         self.lbl_file.setText(
             f"{os.path.basename(self.state.excel_path)} — {len(rows)} строк(и)")
         self._fill_table()

@@ -50,7 +50,7 @@ python run.py
 
 ```
 python make_test_data.py      # тестовые шаблоны и Excel в testdata/
-python tests/headless_test.py # 90+ проверок (реальный шаблон — при наличии в Downloads)
+python tests/headless_test.py # 100+ проверок на синтетических фикстурах
 ```
 
 Подробности реализации и ограничения — в `REPORT.md`.

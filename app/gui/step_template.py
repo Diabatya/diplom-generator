@@ -679,6 +679,12 @@ class StepTemplate(QWidget):
         if not self.state.fields:
             QMessageBox.warning(self, "Поля", "Создайте хотя бы одно поле.")
             return
+        if self.state.template_type == TEMPLATE_PPTX:
+            issues = pptx_engine.required_placement_issues(
+                self._prs, self.state.fields, self.state.slide_sel)
+            if issues:
+                QMessageBox.warning(self, "Привязки", "\n".join(issues))
+                return
         empty = [f.name for f in self.state.fields if not f.placements]
         if empty:
             ans = QMessageBox.question(

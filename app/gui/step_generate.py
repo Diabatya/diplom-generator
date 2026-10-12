@@ -13,7 +13,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from app.core import excel_reader
+from app.core import excel_reader, pptx_engine
+from app.core.models import TEMPLATE_PPTX
 from app.core.generator import (
     EXISTS_OVERWRITE, EXISTS_SKIP, EXISTS_SUFFIX,
     MODE_COMBINED, MODE_SEPARATE, generate, planned_filenames,
@@ -173,6 +174,16 @@ class StepGenerate(QWidget):
         if not self.state.template_path or not self.state.rows:
             QMessageBox.warning(self, "Данные", "Нужны шаблон и Excel-файл.")
             return
+        if self.state.template_type == TEMPLATE_PPTX:
+            try:
+                issues = pptx_engine.required_placement_issues(
+                    pptx_engine.open_template(self.state.template_path),
+                    self.state.fields, self.state.slide_sel)
+            except Exception as exc:
+                issues = [f"Не удалось проверить шаблон: {exc}"]
+            if issues:
+                QMessageBox.warning(self, "Привязки", "\n".join(issues))
+                return
 
         dlg = ModeDialog(self)
         if dlg.exec() != QDialog.Accepted:
