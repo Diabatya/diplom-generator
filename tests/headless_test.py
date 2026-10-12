@@ -821,7 +821,8 @@ def main():
 
     inherited_master = Presentation()
     master_style = inherited_master.slide_masters[0].element.find(qn("p:txStyles"))
-    level = master_style.find(qn("p:bodyStyle")).find(qn("a:lvl1pPr"))
+    # text boxes are styled by p:otherStyle (bodyStyle is for placeholders)
+    level = master_style.find(qn("p:otherStyle")).find(qn("a:lvl1pPr"))
     master_rpr = level.find(qn("a:defRPr"))
     master_rpr.set("sz", "4400")
     master_rpr.find(qn("a:latin")).set("typeface", "Arial")
@@ -944,7 +945,170 @@ def main():
           not blocked_navigation and generator_step._worker is None)
     template_step.close()
     generator_step.close()
+
+    # ---- review7: empty sheet with a different schema keeps the mapping ---
+    swap_path = os.path.join(tmp, "swap_sheets.xlsx")
+    swap_book = openpyxl.Workbook()
+    ws_filled = swap_book.active
+    ws_filled.title = "Filled"
+    ws_filled.append(["Номинация", "ФИО", "Регион"])
+    ws_filled.append(["Тестовая номинация", "Участник А", "Тестовый регион"])
+    ws_empty = swap_book.create_sheet("Empty")
+    ws_empty.append(["ФИО", "Номинация"])   # same titles, reversed order, no rows
+    swap_book.create_sheet("Broken").append(["ФИО"])
+    swap_book.save(swap_path)
+    swap_book.close()
+    swap_state = AppState(fields=[Field("ФИО", required=True), Field("Номинация"),
+                                  Field("Регион"), Field("Город")])
+    step2 = StepExcel(swap_state, lambda: None, lambda: None)
+    expected_map = {"ФИО": 1, "Номинация": 0, "Регион": 2, "Город": 2}
+    with patch.object(QFileDialog, "getOpenFileName", return_value=(swap_path, "")), \
+         patch.object(QMessageBox, "warning", return_value=QMessageBox.Ok):
+        step2._open_excel()
+        # manual mapping of a non-standard field name to the "Регион" column
+        step2._combos["Город"].setCurrentIndex(4)
+        check("review7: initial map set", swap_state.colmap == expected_map,
+              str(swap_state.colmap))
+        step2.cmb_sheet.setCurrentIndex(1)   # Empty with reversed headers
+        step2.cmb_sheet.setCurrentIndex(0)   # back to Filled
+        check("review7: swapped empty sheet keeps column mapping",
+              swap_state.colmap == expected_map, str(swap_state.colmap))
+    real_read = excel_reader.read_xlsx
+    def flaky_read(path, sheet=None):
+        if sheet == "Broken":
+            raise OSError("read failed")
+        return real_read(path, sheet)
+    with patch("app.gui.step_excel.excel_reader.read_xlsx", side_effect=flaky_read), \
+         patch.object(QMessageBox, "critical", return_value=QMessageBox.Ok):
+        step2.cmb_sheet.setCurrentIndex(2)   # Broken: read error
+    with patch.object(QMessageBox, "warning", return_value=QMessageBox.Ok):
+        step2.cmb_sheet.setCurrentIndex(0)
+    check("review7: read failure keeps column mapping",
+          swap_state.colmap == expected_map, str(swap_state.colmap))
+    # end-to-end: generated PPTX must put each value in its own block
+    mini = Presentation()
+    mini_slide = mini.slides.add_slide(mini.slide_layouts[6])
+    m_fio = mini_slide.shapes.add_textbox(Cm(1), Cm(2), Cm(10), Cm(2))
+    m_fio.text_frame.text = "@@FIO@@"
+    m_nom = mini_slide.shapes.add_textbox(Cm(1), Cm(6), Cm(14), Cm(2))
+    m_nom.text_frame.text = "Номинация: «Тестовая номинация»"
+    mini_file = os.path.join(tmp, "mini.pptx")
+    mini.save(mini_file)
+    mini_fields = [
+        Field("ФИО", [PptxPlacement(0, m_fio.shape_id, "@@FIO@@", "@@FIO@@",
+                                    "token")], required=True),
+        Field("Номинация", [PptxPlacement(0, m_nom.shape_id, m_nom.text_frame.text,
+                                          "Тестовая номинация", "fragment")],
+              required=True),
+    ]
+    mini_rep = generate(mini_file, TEMPLATE_PPTX, mini_fields,
+                        {k: v for k, v in swap_state.colmap.items() if k != "Город"},
+                        swap_state.rows, os.path.join(tmp, "mini_out"),
+                        MODE_SEPARATE, swap_state.colmap["ФИО"])
+    mini_texts = [s.text_frame.text for s in Presentation(
+        os.path.join(tmp, "mini_out", mini_rep["created"][0][1])).slides[0].shapes
+        if s.has_text_frame]
+    check("review7: generated file puts values in the right blocks",
+          "Участник А" in mini_texts
+          and "Номинация: «Тестовая номинация»" in mini_texts, str(mini_texts))
+    step2.close()
     gui_app.quit()
+
+    # ---- review7: group scale does not fool autofit -----------------------
+    def scaled_group_deck(scale_x, scale_y, nested=False):
+        deck = Presentation()
+        s = deck.slides.add_slide(deck.slide_layouts[6])
+        grp = s.shapes.add_group_shape()
+        parent = grp
+        if nested:
+            inner = grp.shapes.add_group_shape()
+            parent = inner
+        box = parent.shapes.add_textbox(Pt(5), Pt(5), Pt(300), Pt(100))
+        tf = box.text_frame
+        tf.margin_left = tf.margin_right = tf.margin_top = tf.margin_bottom = 0
+        tf.word_wrap = False
+        par = tf.paragraphs[0]
+        par.font.name = "Arial"
+        par.font.size = Pt(44)
+        par.add_run().text = "@@FIO@@"
+        if nested:
+            inner.width = int(inner.width * 2)
+            inner.height = int(inner.height * 2)
+        grp.width = int(grp.width * scale_x)
+        grp.height = int(grp.height * scale_y)
+        return s, box
+
+    for tag, sx, sy, nested in (("x2", 2, 2, False), ("x0.5", 0.5, 0.5, False),
+                                ("nested", 2, 2, True), ("aniso", 2, 1, False)):
+        gs, gbox = scaled_group_deck(sx, sy, nested)
+        gnote = pptx_engine.apply_field_to_slide(
+            gs, PptxPlacement(0, gbox.shape_id, token="@@FIO@@", mode="fragment"),
+            "Тестовый Участник А")
+        grun = next(r for r in gbox.text_frame.paragraphs[0].runs if "Тестовый" in r.text)
+        check(f"review7: group {tag} autofit uses local coords",
+              grun.font.size is not None and grun.font.size.pt < 44
+              and any("уменьшен" in n or "не поместился" in n for n in gnote),
+              f"notes={gnote} size={grun.font.size}")
+
+    # ---- review7: shape text resolves p:otherStyle ------------------------
+    from pptx.enum.shapes import MSO_SHAPE
+    from app.core.fonts import measure_text_width
+    style_deck = Presentation()
+    tx = style_deck.slide_masters[0].element.find(qn("p:txStyles"))
+    body_rpr = tx.find(qn("p:bodyStyle")).find(qn("a:lvl1pPr")).find(qn("a:defRPr"))
+    body_rpr.set("sz", "3200")
+    body_rpr.set("b", "1")
+    body_rpr.find(qn("a:latin")).set("typeface", "Times New Roman")
+    other_rpr = tx.find(qn("p:otherStyle")).find(qn("a:lvl1pPr")).find(qn("a:defRPr"))
+    other_rpr.set("sz", "4400")
+    other_rpr.find(qn("a:latin")).set("typeface", "Arial")
+    style_slide = style_deck.slides.add_slide(style_deck.slide_layouts[6])
+    rect = style_slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Pt(5), Pt(5), Pt(300), Pt(100))
+    rect.text_frame.margin_left = rect.text_frame.margin_right = 0
+    rect.text_frame.word_wrap = False
+    rect.text_frame.text = "@@FIO@@"
+    eff = pptx_engine._effective_run_style(
+        style_slide, rect, rect.text_frame, rect.text_frame.paragraphs[0],
+        rect.text_frame.paragraphs[0].runs[0]._r)
+    check("review7: autoshape resolves otherStyle (size/family/bold)",
+          eff == (44.0, "Arial", False), str(eff))
+    arial = find_font_file("Arial")
+    aval = "Участник Тестовый"
+    overflow_at_44 = measure_text_width(aval, arial, 44) > 300
+    s_note = pptx_engine.apply_field_to_slide(
+        style_slide, PptxPlacement(0, rect.shape_id, token="@@FIO@@",
+                                   mode="fragment"), aval)
+    s_run = next(r for r in rect.text_frame.paragraphs[0].runs if "Участник" in r.text)
+    check("review7: autoshape fragment uses otherStyle size",
+          (not overflow_at_44) or
+          (any("уменьшен" in n or "не поместился" in n for n in s_note)
+           and s_run.font.size is not None and s_run.font.size.pt < 44),
+          f"notes={s_note} w44={measure_text_width(aval, arial, 44):.0f}")
+    rect2 = style_slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Pt(5), Pt(200), Pt(300), Pt(100))
+    rect2.text_frame.margin_left = rect2.text_frame.margin_right = 0
+    rect2.text_frame.word_wrap = False
+    rect2.text_frame.text = "Шаблонный текст"
+    w_note = pptx_engine.apply_field_to_slide(
+        style_slide, PptxPlacement(0, rect2.shape_id, "Шаблонный текст", "", "whole"),
+        aval)
+    w_run = next((r for r in rect2.text_frame.paragraphs[0].runs if "Участник" in r.text),
+                 None)
+    check("review7: autoshape whole uses otherStyle size",
+          (not overflow_at_44) or
+          (any("уменьшен" in n or "не поместился" in n for n in w_note)
+           and w_run is not None and w_run.font.size is not None
+           and w_run.font.size.pt < 44),
+          f"notes={w_note}")
+    style_file = os.path.join(tmp, "styled_shape.pptx")
+    style_deck.save(style_file)
+    reloaded = Presentation(style_file).slides[0]
+    reloaded_run = next(r for s in reloaded.shapes if s.has_text_frame
+                        for r in s.text_frame.paragraphs[0].runs
+                        if "Участник" in r.text)
+    check("review7: autoshape size survives save/reopen",
+          reloaded_run.font.size is not None
+          and reloaded_run.font.size.pt < 44 or not overflow_at_44,
+          str(reloaded_run.font.size))
 
     # ---- anonymized end-to-end fixture: 6 rows -> combined deck ---------
     fixture_pptx = os.path.join(tmp, "fixture_template.pptx")

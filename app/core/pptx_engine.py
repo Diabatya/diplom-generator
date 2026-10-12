@@ -131,13 +131,6 @@ def find_shape(slide, shape_id: int):
     return None
 
 
-def _find_with_scale(slide, shape_id: int):
-    for shp, _, _, sx, sy in _walk_shapes(slide.shapes):
-        if shp.shape_id == shape_id:
-            return shp, sx, sy
-    return None, 1.0, 1.0
-
-
 def _shape_text_width_pt(shape) -> float:
     tf = shape.text_frame
     ml = tf.margin_left if tf.margin_left is not None else Emu(91440)
@@ -154,8 +147,12 @@ def _shape_text_height_pt(shape) -> float:
 
 def _target_frame_and_box(slide, placement: PptxPlacement):
     """Resolve the text_frame and (width_pt, height_pt) for a placement —
-    either a shape's text frame or a table cell. Group scaling applied."""
-    shape, sx, sy = _find_with_scale(slide, placement.shape_id)
+    either a shape's text frame or a table cell. Sizes are in the shape's
+    local (child) coordinate space: a group transform scales the rendered
+    text and the box by the same factor, so it cancels out of the fit
+    math. Slide-absolute bounds are only needed by list_text_shapes for
+    the UI overlay."""
+    shape = find_shape(slide, placement.shape_id)
     if shape is None:
         return None, None, 0.0, 0.0
     if placement.cell is not None:
@@ -166,13 +163,17 @@ def _target_frame_and_box(slide, placement: PptxPlacement):
             cell = shape.table.cell(r, c)
         except IndexError:
             return shape, None, 0.0, 0.0
-        w = shape.table.columns[c].width * sx / EMU_PER_PT
-        h = shape.table.rows[r].height * sy / EMU_PER_PT
+        ml = cell.margin_left if cell.margin_left is not None else Emu(91440)
+        mr = cell.margin_right if cell.margin_right is not None else Emu(91440)
+        mt = cell.margin_top if cell.margin_top is not None else Emu(45720)
+        mb = cell.margin_bottom if cell.margin_bottom is not None else Emu(45720)
+        w = (shape.table.columns[c].width - ml - mr) / EMU_PER_PT
+        h = (shape.table.rows[r].height - mt - mb) / EMU_PER_PT
         return shape, cell.text_frame, w, h
     if not shape.has_text_frame:
         return shape, None, 0.0, 0.0
     return shape, shape.text_frame, \
-        _shape_text_width_pt(shape) * sx, _shape_text_height_pt(shape) * sy
+        _shape_text_width_pt(shape), _shape_text_height_pt(shape)
 
 
 def required_placement_issues(prs: Presentation, fields: list[Field], slide_sel=None) -> list[str]:
@@ -359,8 +360,12 @@ def _effective_run_style(slide, shape, tf, para, r_el):
                                   if parent_lvl is not None else None)
     tx_styles = master.element.find(qn("p:txStyles"))
     if tx_styles is not None:
-        type_name = (shape.placeholder_format.type.name if shape.is_placeholder else "")
-        key = "titleStyle" if type_name in ("TITLE", "CENTER_TITLE") else "bodyStyle"
+        if shape.is_placeholder:
+            ph_name = shape.placeholder_format.type.name
+            key = "titleStyle" if ph_name in ("TITLE", "CENTER_TITLE") else "bodyStyle"
+        else:
+            # Text in shapes and text boxes is styled by otherStyle.
+            key = "otherStyle"
         branch = tx_styles.find(qn(f"p:{key}"))
         lvl = branch.find(qn(f"a:lvl{level}pPr")) if branch is not None else None
         candidates.append(lvl.find(qn("a:defRPr")) if lvl is not None else None)

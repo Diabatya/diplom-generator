@@ -74,6 +74,8 @@ class StepExcel(QWidget):
         self._combos: dict[str, QComboBox] = {}
         self._constants = {}
         self._sheets: list[str] = []
+        self._colmap_titles: dict[str, str] = {}
+        self._name_col_title = None
 
         root = QVBoxLayout(self)
         top = QHBoxLayout()
@@ -168,6 +170,8 @@ class StepExcel(QWidget):
             self.state.headers = []
             self.state.rows = []
             self.state.sheet_name = None
+            self._colmap_titles = {}
+            self._name_col_title = None
         self.state.excel_path = path
         self.cmb_sheet.blockSignals(True)
         self.cmb_sheet.clear()
@@ -181,6 +185,15 @@ class StepExcel(QWidget):
             self._load_sheet(self._sheets[idx])
 
     def _clear_sheet(self, sheet_name: str, headers=None):
+        if self.state.rows:
+            # Preserve the mapping by column title — indices into the old
+            # header list are meaningless once a different schema is shown.
+            self._colmap_titles = {name: self.state.headers[i]
+                                   for name, i in self.state.colmap.items()
+                                   if 0 <= i < len(self.state.headers)}
+            kind, val = self.state.filename_source
+            if kind == "col" and 0 <= val < len(self.state.headers):
+                self._name_col_title = self.state.headers[val]
         self.state.sheet_name = sheet_name
         self.state.headers = headers or []
         self.state.rows = []
@@ -204,8 +217,13 @@ class StepExcel(QWidget):
             self._clear_sheet(sheet_name, headers)
             QMessageBox.warning(self, "Excel", "Лист пуст или нет данных после строки заголовков.")
             return
-        previous = {name: self.state.headers[i] for name, i in self.state.colmap.items()
-                    if 0 <= i < len(self.state.headers)}
+        if self._colmap_titles:
+            previous = self._colmap_titles
+            self._colmap_titles = {}
+        else:
+            previous = {name: self.state.headers[i]
+                        for name, i in self.state.colmap.items()
+                        if 0 <= i < len(self.state.headers)}
         self.state.colmap = {name: headers.index(title) for name, title in previous.items()
                              if title in headers}
         self.state.sheet_name = sheet_name
@@ -310,6 +328,11 @@ class StepExcel(QWidget):
         """Populate the 'field for file name' combo: template fields first,
         then raw Excel columns. Keeps the previous choice when possible."""
         prev = self.state.filename_source
+        if self._name_col_title is not None:
+            if self._name_col_title in self.state.headers:
+                prev = ("col", self.state.headers.index(self._name_col_title))
+                self.state.filename_source = prev
+            self._name_col_title = None
         self.cmb_name.blockSignals(True)
         self.cmb_name.clear()
         default_idx = choose_filename_field(self.state.fields) if self.state.fields else -1
