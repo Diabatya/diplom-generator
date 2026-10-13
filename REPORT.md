@@ -274,7 +274,14 @@ Actions → последний зелёный «Build Windows exe» → Artifact
 правок ревью итерации 6: `actions/runs/38260617690` (113/113 +
 10/10 `--selftest`). Прогон после второго раунда ревью:
 `actions/runs/38263683411` (125/125 + 10/10 `--selftest`). Тег `v*` в том же
-workflow дополнительно создаёт релиз с exe (релиз `v1.0.0` существует).
+workflow дополнительно создаёт релиз с exe.
+
+**Релиз `v1.1.0`** (merge `35a3b5a` в `main` через PR #1): прогон main
+`actions/runs/38265805623` и прогон тега `actions/runs/38352114370` —
+125/125 headless + 10/10 `--selftest`, код 0. Exe 81 535 184 байта,
+SHA-256 `601EFFD67B60995E1731A988C7B66EC4BE28CEFF5EBA18C7EC8AC65B3E611F60`.
+В релизе: `DiplomGenerator.exe` (из сборки тега) и пустой
+`participants-template.xlsx`.
 
 Пересборка локально на Windows: `build.bat` → `dist\DiplomGenerator.exe`.
 Самопроверка бинаря: `DiplomGenerator.exe --selftest` — отчёт пишется в
