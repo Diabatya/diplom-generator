@@ -15,7 +15,8 @@ except ImportError:  # older PyMuPDF
     import fitz  # type: ignore  # PyMuPDF
 
 from . import fonts as fontlib
-from .models import Field, PdfPlacement
+from . import signature as sig
+from .models import Field, PdfPlacement, SignatureSpec
 
 
 
@@ -192,15 +193,33 @@ def _apply_placements(doc: fitz.Document, fields: list[Field], values: dict[str,
     return notes
 
 
-def render_pdf_doc(template_path: str, fields: list[Field], values: dict[str, str]):
+def _apply_signature(doc: fitz.Document, spec: SignatureSpec | None) -> None:
+    """Stamp the facsimile image on every page, aspect-fit inside the
+    stored rect (PDF points). PNG transparency is preserved."""
+    if spec is None or not spec.enabled or spec.rect is None:
+        return
+    iw, ih = sig.image_size_px(spec.image_path)
+    for page in doc:
+        clamped = sig.clamp_rect(spec.rect, page.rect.width, page.rect.height)
+        x, y, w, h = sig.fit_box(iw, ih, clamped)
+        if w <= 0 or h <= 0:
+            continue
+        page.insert_image(fitz.Rect(x, y, x + w, y + h),
+                          filename=spec.image_path, keep_proportion=False)
+
+
+def render_pdf_doc(template_path: str, fields: list[Field], values: dict[str, str],
+                   signature: SignatureSpec | None = None):
     """Return an in-memory edited document plus review notes."""
     doc = fitz.open(template_path)
     notes = _apply_placements(doc, fields, values)
+    _apply_signature(doc, signature)
     return doc, notes
 
 
-def render_single(template_path: str, fields: list[Field], values: dict[str, str], out_path: str):
-    doc, notes = render_pdf_doc(template_path, fields, values)
+def render_single(template_path: str, fields: list[Field], values: dict[str, str], out_path: str,
+                  signature: SignatureSpec | None = None):
+    doc, notes = render_pdf_doc(template_path, fields, values, signature)
     try:
         doc.save(out_path, garbage=4, deflate=True)
     finally:

@@ -1174,6 +1174,203 @@ def main():
     check("iter6: original template and Excel unchanged",
           th == _sha(fixture_pptx) and xh == _sha(fixture_xlsx))
 
+    # ---- iter7: facsimile signature ------------------------------------------
+    from app.core import signature as sigmod
+    from app.core.models import SignatureSpec
+    from PySide6.QtCore import Qt, QPointF
+    from PySide6.QtGui import QImage, QPixmap
+    import struct, zlib
+
+    def _png_rgba(path, w, h):
+        """Deterministic RGBA PNG: dark-blue diagonal strokes on alpha 0."""
+        def chunk(tag, data):
+            return (struct.pack(">I", len(data)) + tag + data
+                    + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+        raw = b"".join(
+            b"\x00" + b"".join(
+                bytes((11, 61, 145, 255)) if (x + y) % 9 < 4
+                else bytes((0, 0, 0, 0)) for x in range(w))
+            for y in range(h))
+        with open(path, "wb") as fh:
+            fh.write(b"\x89PNG\r\n\x1a\n"
+                     + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+                     + chunk(b"IDAT", zlib.compress(raw))
+                     + chunk(b"IEND", b""))
+
+    sig_png = os.path.join(tmp, "sig.png")
+    _png_rgba(sig_png, 200, 80)
+    sig_jpg = os.path.join(tmp, "sig.jpg")
+    QImage(200, 80, QImage.Format_RGB32).save(sig_jpg, "JPG")
+    doc_w_pt = Cm(28) / 12700.0
+    doc_h_pt = Cm(20) / 12700.0
+    sig_rect = (doc_w_pt - 240, doc_h_pt - 140, doc_w_pt - 40, doc_h_pt - 40)
+
+    check("iter7: png/jpg accepted, bad files rejected",
+          sigmod.image_error(sig_png) is None
+          and sigmod.image_error(sig_jpg) is None
+          and sigmod.image_error("") is not None
+          and sigmod.image_error(os.path.join(tmp, "nope.png")) is not None
+          and sigmod.image_error(fixture_xlsx) is not None)
+
+    check("iter7: spec validation covers missing pieces",
+          sigmod.issues(SignatureSpec(True, sig_png, sig_rect), doc_w_pt, doc_h_pt) == []
+          and sigmod.issues(SignatureSpec(True, sig_png, None), doc_w_pt, doc_h_pt)
+          and sigmod.issues(SignatureSpec(True, "", sig_rect), doc_w_pt, doc_h_pt)
+          and sigmod.issues(SignatureSpec(True, sig_png, (5, 5, 10, 10)),
+                            doc_w_pt, doc_h_pt)
+          and sigmod.issues(SignatureSpec(True, sig_png,
+                                          (doc_w_pt + 10, 0, doc_w_pt + 40, 30)),
+                            doc_w_pt, doc_h_pt)
+          and not sigmod.issues(SignatureSpec(False, "", None),
+                                doc_w_pt, doc_h_pt))
+
+    sig_spec = SignatureSpec(True, sig_png, sig_rect)
+    sig_rep = generate(fixture_pptx, TEMPLATE_PPTX, field_map,
+                       {n: rh.index(n) for n in ("ФИО", "Номинация", "Управление")},
+                       rr, os.path.join(tmp, "sig_out"), MODE_COMBINED,
+                       rh.index("ФИО"), signature=sig_spec)
+    sig_deck = Presentation(os.path.join(tmp, "sig_out", sig_rep["created"][0][1]))
+    pics = [[s for s in sl.shapes
+             if s.name == pptx_engine.SIGNATURE_PICTURE_NAME]
+            for sl in sig_deck.slides]
+    check("iter7: combined pptx — one signature picture on every slide",
+          len(sig_deck.slides) == 6 and all(len(p) == 1 for p in pics))
+    boxes = [(p[0].left, p[0].top, p[0].width, p[0].height) for p in pics]
+    check("iter7: identical signature placement on all slides",
+          len(set(boxes)) == 1)
+    l0, t0, w0, h0 = boxes[0]
+    # 200x80 px in a 200x100 pt rect -> scale 1.0, vertically centered
+    exp_w, exp_h = int(200 * 12700), int(80 * 12700)
+    check("iter7: aspect preserved, fit inside rect",
+          abs(w0 - exp_w) < 3 * 12700 and abs(h0 - exp_h) < 3 * 12700
+          and l0 >= int(sig_rect[0] * 12700) - 12700
+          and t0 >= int(sig_rect[1] * 12700) - 12700
+          and l0 + w0 <= int(sig_rect[2] * 12700) + 12700
+          and t0 + h0 <= int(sig_rect[3] * 12700) + 12700,
+          f"{l0},{t0} {w0}x{h0}")
+    check("iter7: png transparency kept (RGBA image part)",
+          pics[0][0].image.blob[25] in (4, 6))
+
+    # idempotency: stamping the same slide twice must not stack copies
+    idem = Presentation(fixture_pptx)
+    pptx_engine.add_signature_to_slide(idem.slides[0], sig_spec,
+                                       doc_w_pt, doc_h_pt)
+    pptx_engine.add_signature_to_slide(idem.slides[0], sig_spec,
+                                       doc_w_pt, doc_h_pt)
+    check("iter7: re-stamping replaces, no duplicates",
+          sum(1 for s in idem.slides[0].shapes
+              if s.name == pptx_engine.SIGNATURE_PICTURE_NAME) == 1)
+
+    # separate mode gets the same picture at the same coordinates
+    sep_rep = generate(fixture_pptx, TEMPLATE_PPTX, field_map,
+                       {n: rh.index(n) for n in ("ФИО", "Номинация", "Управление")},
+                       rr[:1], os.path.join(tmp, "sig_sep"), MODE_SEPARATE,
+                       rh.index("ФИО"), signature=sig_spec)
+    sep_pic = next(s for s in Presentation(
+        os.path.join(tmp, "sig_sep", sep_rep["created"][0][1])).slides[0].shapes
+        if s.name == pptx_engine.SIGNATURE_PICTURE_NAME)
+    check("iter7: separate pptx placement matches combined",
+          (sep_pic.left, sep_pic.top, sep_pic.width, sep_pic.height) == boxes[0])
+
+    # pdf mode stamps the image on every page too
+    pdf_sig_rep = generate(T_PDF, TEMPLATE_PDF, pfields, cm, rows[:2],
+                           os.path.join(tmp, "sig_pdf"), MODE_COMBINED, 0,
+                           signature=SignatureSpec(True, sig_png, sig_rect))
+    pdf_sig_doc = fitz.open(os.path.join(tmp, "sig_pdf",
+                                         pdf_sig_rep["created"][0][1]))
+    check("iter7: pdf pages carry the signature image",
+          pdf_sig_doc.page_count == 2
+          and all(pdf_sig_doc[i].get_images() for i in range(2)))
+    pdf_sig_doc.close()
+
+    # invalid signature blocks generation before touching the output dir
+    bad_out = os.path.join(tmp, "sig_bad")
+    bad_rep = generate(fixture_pptx, TEMPLATE_PPTX, field_map,
+                       {n: rh.index(n) for n in ("ФИО", "Номинация", "Управление")},
+                       rr[:1], bad_out, MODE_SEPARATE, rh.index("ФИО"),
+                       signature=SignatureSpec(True, "", None))
+    check("iter7: broken signature stops generation early",
+          not bad_rep["created"]
+          and any("подпись" in rsn for _r, rsn in bad_rep["skipped"]))
+
+    # ---- iter7: canvas signature editing ---------------------------------
+    from PySide6.QtTest import QTest
+    from app.gui.canvas import MODE_SIGNATURE, PreviewCanvas
+    gui_app2 = QApplication.instance() or QApplication([])
+    canvas = PreviewCanvas()
+    canvas.resize(800, 567)   # ~28x20 cm slide at ~1 px/pt
+    canvas.set_image(QPixmap(793, 567), 793.0, 567.0)
+    canvas.set_signature(sig_rect, QPixmap(sig_png))
+    seen = []
+    canvas.sigSignatureChanged.connect(lambda *r: seen.append(r))
+
+    def draw(c, a, b):
+        QTest.mousePress(c, Qt.LeftButton, Qt.NoModifier, a.toPoint())
+        QTest.mouseMove(c, b.toPoint())
+        QTest.mouseRelease(c, Qt.LeftButton, Qt.NoModifier, b.toPoint())
+
+    def view_pt(rect, cw, ch):
+        """doc-pt rect -> widget px endpoints at canvas size cw x ch."""
+        s = min(cw / 793.0, ch / 567.0)
+        mx, my = (cw - 793 * s) / 2, (ch - 567 * s) / 2
+        return (QPointF(mx + rect[0] * s, my + rect[1] * s),
+                QPointF(mx + rect[2] * s, my + rect[3] * s), s, mx, my)
+
+    canvas.set_mode(MODE_SIGNATURE)
+    canvas.show()
+    a1, b1, _s1, _mx1, _my1 = view_pt(sig_rect, 800, 567)
+    draw(canvas, a1, b1)
+    check("iter7: drawn signature rect in slide coords",
+          bool(seen) and abs(seen[-1][0] - sig_rect[0]) < 3
+          and abs(seen[-1][2] - sig_rect[2]) < 3
+          and abs(seen[-1][3] - sig_rect[3]) < 3, str(seen[-1] if seen else None))
+
+    # same gesture at another widget size -> same document coordinates
+    canvas.resize(1200, 850)
+    a2, b2, _s2, _mx2, _my2 = view_pt(sig_rect, 1200, 850)
+    draw(canvas, a2, b2)
+    check("iter7: preview zoom does not change doc coordinates",
+          bool(seen) and abs(seen[-1][0] - sig_rect[0]) < 3
+          and abs(seen[-1][2] - sig_rect[2]) < 3,
+          str(seen[-1] if seen else None))
+
+    # move: press inside the rect and drag 30 px right / 15 px down
+    canvas.resize(800, 567)
+    _a3, _b3, s2, mx, my = view_pt(sig_rect, 800, 567)
+    ctr = QPointF(mx + (sig_rect[0] + 100) * s2, my + (sig_rect[1] + 50) * s2)
+    draw(canvas, ctr, QPointF(ctr.x() + 30, ctr.y() + 15))
+    moved = seen[-1]
+    check("iter7: move keeps size, shifts origin",
+          abs(moved[0] - sig_rect[0] - 30 / s2) < 3
+          and abs(moved[1] - sig_rect[1] - 15 / s2) < 3
+          and abs((moved[2] - moved[0]) - (sig_rect[2] - sig_rect[0])) < 3,
+          str(moved))
+
+    # resize via the bottom-right handle (press lands 4px inside the handle,
+    # so the corner moves by dragdelta - 4)
+    hr = QPointF(mx + moved[2] * s2 - 4, my + moved[3] * s2 - 4)
+    draw(canvas, hr, QPointF(hr.x() + 40, hr.y() + 20))
+    grown = seen[-1]
+    check("iter7: corner handle resizes, origin stays",
+          abs(grown[0] - moved[0]) < 3
+          and abs(grown[2] - moved[2] - 36 / s2) < 3
+          and abs(grown[3] - moved[3] - 16 / s2) < 3, str(grown))
+    canvas.close()
+
+    # template/slide change drops the stored area and asks for a new one
+    sig_state = AppState(template_path=fixture_pptx,
+                         template_type=TEMPLATE_PPTX)
+    sig_state.signature = SignatureSpec(True, sig_png, sig_rect)
+    sig_step = StepTemplate(sig_state, lambda: None)
+    sig_step._prs = Presentation(fixture_pptx)
+    sig_step._doc_w, sig_step._doc_h = doc_w_pt, doc_h_pt
+    sig_step._sig_toggled(True)
+    sig_step._reset_signature_area()
+    check("iter7: template/slide change clears the stored area",
+          sig_state.signature.rect is None and sig_state.signature.enabled)
+    sig_step.close()
+    gui_app2.quit()
+
     # ---- perf: 150 rows -------------------------------------------------------
     big_rows = [[f"{n} Тестович{i}", REGIONS[i % len(REGIONS)]]
                 for i, n in enumerate(NAMES * 15)]

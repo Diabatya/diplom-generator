@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from app.core.models import Field
+from app.core.models import Field, SignatureSpec
 
 
 @dataclass
@@ -13,6 +13,7 @@ class AppState:
     template_type: str | None = None  # "pptx" | "pdf"
     fields: list[Field] = field(default_factory=list)
     slide_sel: list[int] | None = None
+    signature: SignatureSpec = field(default_factory=SignatureSpec)
 
     excel_path: str | None = None
     sheet_name: str | None = None

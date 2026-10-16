@@ -103,6 +103,38 @@ Placement = PdfPlacement | PptxPlacement
 
 
 @dataclass
+class SignatureSpec:
+    """Optional facsimile signature stamped on every output slide/page.
+
+    ``rect`` is (x0, y0, x1, y1) in document points (PPTX: EMU/12700,
+    PDF: native page points) measured on the template the user previewed.
+    The image is aspect-fit inside the rect, never stretched or cropped.
+    """
+
+    enabled: bool = False
+    image_path: str = ""
+    rect: tuple[float, float, float, float] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "image_path": self.image_path,
+            "rect": list(self.rect) if self.rect else None,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "SignatureSpec":
+        rect = d.get("rect")
+        return cls(
+            enabled=bool(d.get("enabled", False)),
+            image_path=str(d.get("image_path", "")),
+            rect=(tuple(float(v) for v in rect)
+                  if isinstance(rect, (list, tuple)) and len(rect) == 4
+                  else None),
+        )
+
+
+@dataclass
 class Field:
     """A named placeholder bound to one or more placements on the template."""
 
