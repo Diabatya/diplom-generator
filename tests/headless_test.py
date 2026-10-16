@@ -1655,6 +1655,112 @@ def main():
           str(rep_multi["skipped"][:3]))
     gui_app3.quit()
 
+    # ---- review9: theme bgRef backgrounds ------------------------------------
+    gui_app4 = QApplication.instance() or QApplication([])
+    from pptx.oxml.xmlchemy import OxmlElement
+    from pptx.opc.constants import RELATIONSHIP_TYPE as _RT
+
+    def _theme_deck(path):
+        """Deck whose theme has fillStyleLst[0]=red solid,
+        fillStyleLst[1]=green->yellow gradient, bgFillStyleLst[0]=blue
+        solid, bgFillStyleLst[1]=teal->purple gradient."""
+        p = Presentation()
+        p.slide_width, p.slide_height = Cm(28), Cm(20)
+        s = p.slides.add_slide(p.slide_layouts[6])
+        tp = s.slide_layout.slide_master.part.part_related_by(_RT.THEME)
+        root = _et.fromstring(tp.blob)
+        fmt = root.find(".//" + _qn("a:fmtScheme"))
+        f_sl = fmt.find(_qn("a:fillStyleLst"))
+        f_sl.replace(f_sl[0], _et.fromstring(
+            '<a:solidFill xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+            '<a:srgbClr val="FF0000"/></a:solidFill>'))
+        f_sl.replace(f_sl[1], _et.fromstring(
+            '<a:gradFill xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+            '<a:gsLst><a:gs pos="0"><a:srgbClr val="00FF00"/></a:gs>'
+            '<a:gs pos="100000"><a:srgbClr val="FFFF00"/></a:gs></a:gsLst>'
+            '<a:lin ang="0"/></a:gradFill>'))
+        b_sl = fmt.find(_qn("a:bgFillStyleLst"))
+        b_sl.replace(b_sl[0], _et.fromstring(
+            '<a:solidFill xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+            '<a:srgbClr val="0000FF"/></a:solidFill>'))
+        while len(b_sl) < 2:
+            b_sl.append(_et.fromstring(
+                '<a:solidFill xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+                '<a:srgbClr val="FFFFFF"/></a:solidFill>'))
+        b_sl.replace(b_sl[1], _et.fromstring(
+            '<a:gradFill xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+            '<a:gsLst><a:gs pos="0"><a:srgbClr val="008080"/></a:gs>'
+            '<a:gs pos="100000"><a:srgbClr val="800080"/></a:gs></a:gsLst>'
+            '<a:lin ang="0"/></a:gradFill>'))
+        tp._blob = _et.tostring(root)
+        p.save(path)
+        return Presentation(path)
+
+    def _set_bgref(obj, idx, ref_rgb="00FF00"):
+        csld = obj.element.find(_qn("p:cSld"))
+        old = csld.find(_qn("p:bg"))
+        if old is not None:
+            csld.remove(old)
+        bg = OxmlElement("p:bg")
+        ref = OxmlElement("p:bgRef")
+        ref.set("idx", str(idx))
+        clr = OxmlElement("a:srgbClr")
+        clr.set("val", ref_rgb)
+        ref.append(clr)
+        bg.append(ref)
+        csld.insert(0, bg)
+
+    def _px_of(path, x=400, y=300):
+        img = pptx_render.render_slide(Presentation(path), 0, 72).toImage()
+        return img.pixelColor(x, y).name()
+
+    # master bgRef -> bgFillStyleLst (1001 = first bg fill), theme found
+    # through the layout->master chain even from a slide-level ref
+    th_path = os.path.join(tmp, "theme_master.pptx")
+    _p = _theme_deck(th_path)
+    _set_bgref(_p.slides[0].slide_layout.slide_master, 1001)
+    _p.save(th_path)
+    check("review9: master bgRef idx=1001 -> bgFillStyleLst (blue, not red/green)",
+          _px_of(th_path) == "#0000ff", _px_of(th_path))
+    # same ref on the slide itself: theme still resolved via master chain
+    _p = Presentation(th_path)
+    _set_bgref(_p.slides[0], 1001)
+    _p.save(th_path)
+    check("review9: slide bgRef idx=1001 resolves theme (blue)",
+          _px_of(th_path) == "#0000ff", _px_of(th_path))
+    # layout-level ref, idx=1002 -> second bg fill = teal->purple gradient
+    _p = _theme_deck(th_path)
+    _set_bgref(_p.slides[0].slide_layout, 1002)
+    _p.save(th_path)
+    _img = pptx_render.render_slide(Presentation(th_path), 0, 72).toImage()
+    _c_l = _img.pixelColor(30, 300).name()
+    _c_r = _img.pixelColor(750, 300).name()
+    check("review9: theme gradient fill paints a real gradient",
+          _c_l != _c_r and _c_l != "#ffffff" and _c_r != "#ffffff",
+          f"{_c_l} / {_c_r}")
+    # idx=1 -> fillStyleLst[0] (red); idx=2 -> gradient green->yellow
+    _p = _theme_deck(th_path)
+    _set_bgref(_p.slides[0], 1)
+    _p.save(th_path)
+    check("review9: bgRef idx=1 -> fillStyleLst (red)",
+          _px_of(th_path) == "#ff0000", _px_of(th_path))
+    # idx=0/1000 are documented no-fill sentinels: the slide's own fill is
+    # empty, the layout/master background shows through (blue here)
+    for sentinel in (0, 1000):
+        _p = _theme_deck(th_path)
+        _set_bgref(_p.slides[0], sentinel)
+        _set_bgref(_p.slides[0].slide_layout.slide_master, 1001)
+        _p.save(th_path)
+        check(f"review9: bgRef idx={sentinel} means no fill",
+              _px_of(th_path) == "#0000ff", _px_of(th_path))
+    # index beyond the list -> reference color as documented fallback
+    _p = _theme_deck(th_path)
+    _set_bgref(_p.slides[0], 1050, ref_rgb="112233")
+    _p.save(th_path)
+    check("review9: out-of-range bgRef falls back to ref color",
+          _px_of(th_path) == "#112233", _px_of(th_path))
+    gui_app4.quit()
+
     # ---- perf: 150 rows -------------------------------------------------------
     big_rows = [[f"{n} Тестович{i}", REGIONS[i % len(REGIONS)]]
                 for i, n in enumerate(NAMES * 15)]

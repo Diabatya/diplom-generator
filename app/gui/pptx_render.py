@@ -38,14 +38,12 @@ def _emu2px(v, dpi):
     return v / EMU_PER_PT * dpi / 72.0
 
 
-def _theme_colors(master) -> dict:
-    """scheme-name → "rrggbb" from the master's theme part."""
+def _theme_colors(theme_root) -> dict:
+    """scheme-name → "rrggbb" from a parsed a:theme element."""
     colors = dict(_OFFICE_THEME)
     try:
-        theme_part = master.part.part_related_by(RT.THEME)
         from lxml import etree
-        root = etree.fromstring(theme_part.blob)
-        scheme = root.find(
+        scheme = theme_root.find(
             ".//" + qn("a:themeElements") + "/" + qn("a:clrScheme"))
         for slot in scheme:
             name = etree.QName(slot).localname
@@ -58,6 +56,21 @@ def _theme_colors(master) -> dict:
     except Exception:
         pass
     return colors
+
+
+def _theme_context(slide):
+    """(theme_part, theme_root, fmtScheme, color map) for the slide —
+    resolved through the layout→master chain, since slide/layout parts
+    don't relate to the theme part directly."""
+    try:
+        from lxml import etree
+        master = slide.slide_layout.slide_master
+        theme_part = master.part.part_related_by(RT.THEME)
+        root = etree.fromstring(theme_part.blob)
+        fmt = root.find(".//" + qn("a:themeElements") + "/" + qn("a:fmtScheme"))
+        return theme_part, root, fmt, _theme_colors(root)
+    except Exception:
+        return None, None, None, dict(_OFFICE_THEME)
 
 
 def _clr_to_hex(clr_el, theme: dict, transforms: bool = True):
@@ -133,9 +146,10 @@ def _fill_paint(fill_el, part, theme: dict, rect: QRectF):
         if len(stops) >= 2:
             lin = gf.find(qn("a:lin"))
             import math
+            # DrawingML: ang is clockwise from the 3-o'clock direction
             ang = math.radians(int(lin.get("ang", 0)) / 60000.0) \
                 if lin is not None else 0.0
-            dx, dy = math.sin(ang), -math.cos(ang)
+            dx, dy = math.cos(ang), math.sin(ang)
             grad = QLinearGradient(
                 rect.center().x() - dx * rect.width() / 2,
                 rect.center().y() - dy * rect.height() / 2,
@@ -163,8 +177,12 @@ def _fill_paint(fill_el, part, theme: dict, rect: QRectF):
     return None
 
 
-def _bg_paint(bg_el, part, theme: dict, rect: QRectF):
-    """Resolve p:bg (bgPr or bgRef) to a paintable value."""
+def _bg_paint(bg_el, part, theme_ctx, rect: QRectF):
+    """Resolve p:bg (bgPr or bgRef) to a paintable value.
+
+    ``part`` owns the bg element (its rels serve bgPr blipFill); theme
+    fills — including their images — resolve against the theme part."""
+    theme_part, _root, fmt, theme = theme_ctx
     if bg_el is None:
         return None
     bgpr = bg_el.find(qn("p:bgPr"))
@@ -174,35 +192,39 @@ def _bg_paint(bg_el, part, theme: dict, rect: QRectF):
             return _fill_paint(fill_el, part, theme, rect)
         return None
     bgref = bg_el.find(qn("p:bgRef"))
-    if bgref is not None:
-        idx = int(bgref.get("idx", 0))
-        ref_clr = _first_clr(bgref)
-        try:
-            theme_part = part.part_related_by(RT.THEME)
-            from lxml import etree
-            root = etree.fromstring(theme_part.blob)
-            fmt = root.find(".//" + qn("a:fmtScheme"))
-            lst = fmt.find(qn("a:fillStyleLst") if idx >= 1001
-                           else qn("a:bgFillStyleLst"))
-            fills = list(lst)
-            fill_el = fills[idx - 1001] if idx >= 1001 else fills[idx - 1]
-        except Exception:
-            fill_el = None
-        if fill_el is not None:
-            val = _fill_paint(fill_el, part, theme, rect)
-            if val == "phClr" or (val is None and ref_clr is not None):
-                hexv = (_clr_to_hex(ref_clr, theme)
-                        if ref_clr is not None else None)
-                return QColor("#" + hexv) if hexv else None
-            return val
-        if ref_clr is not None:
-            hexv = _clr_to_hex(ref_clr, theme)
-            if hexv:
-                return QColor("#" + hexv)
-    return None
+    if bgref is None:
+        return None
+    idx = int(bgref.get("idx", 0))
+    ref_clr = _first_clr(bgref)
+
+    def _ref_color():
+        hexv = _clr_to_hex(ref_clr, theme) if ref_clr is not None else None
+        return QColor("#" + hexv) if hexv else None
+
+    if idx in (0, 1000):
+        # documented "no fill" sentinels — not style indexes
+        return None
+    fill_el = None
+    if fmt is not None:
+        # ECMA-376: 1..999 → fillStyleLst[idx-1]; 1001+ → bgFillStyleLst[idx-1001]
+        if idx >= 1001:
+            lst = fmt.find(qn("a:bgFillStyleLst"))
+            i = idx - 1001
+        else:
+            lst = fmt.find(qn("a:fillStyleLst"))
+            i = idx - 1
+        fills = list(lst) if lst is not None else []
+        if 0 <= i < len(fills):
+            fill_el = fills[i]
+    if fill_el is None:
+        return _ref_color()
+    val = _fill_paint(fill_el, theme_part or part, theme, rect)
+    if val is None or val == "phClr":
+        return _ref_color()
+    return val
 
 
-def _slide_bg(slide, theme: dict, rect: QRectF):
+def _slide_bg(slide, theme_ctx, rect: QRectF):
     """Slide → layout → master background fill (first one defined)."""
     for obj in (slide, slide.slide_layout, slide.slide_layout.slide_master):
         try:
@@ -212,7 +234,7 @@ def _slide_bg(slide, theme: dict, rect: QRectF):
         if bg is None:
             continue
         part = obj.part
-        val = _bg_paint(bg, part, theme, rect)
+        val = _bg_paint(bg, part, theme_ctx, rect)
         if val is not None:
             return val
     return None
@@ -374,11 +396,8 @@ def render_slide(prs, slide_index: int, dpi: int = 150) -> QPixmap:
     painter.setRenderHint(QPainter.Antialiasing, True)
     painter.setRenderHint(QPainter.TextAntialiasing, True)
     full = QRectF(0, 0, w, h)
-    try:
-        theme = _theme_colors(slide.slide_layout.slide_master)
-    except Exception:
-        theme = dict(_OFFICE_THEME)
-    bg = _slide_bg(slide, theme, full)
+    theme_ctx = _theme_context(slide)
+    bg = _slide_bg(slide, theme_ctx, full)
     if isinstance(bg, QPixmap):
         painter.drawPixmap(full.toRect(), bg)
     elif bg is not None and bg != "phClr":
