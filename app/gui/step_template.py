@@ -123,7 +123,10 @@ class StepTemplate(QWidget):
         top.addWidget(self.btn_open)
         top.addWidget(self.lbl_template, 1)
         root.addLayout(top)
-        self.lbl_preview = QLabel("PPTX: предпросмотр приблизительный — точный вид проверьте в PowerPoint.")
+        self.lbl_preview = QLabel(
+            "PPTX: предпросмотр показывает фон и графику макета, но является "
+            "приблизительным — финальный вид проверьте через «Пример» и в "
+            "PowerPoint.")
         root.addWidget(self.lbl_preview)
         self.cmb_slide = QComboBox()
         self.cmb_slide.setVisible(False)
@@ -381,14 +384,19 @@ class StepTemplate(QWidget):
                             if "slide_sel" in extra:
                                 self.state.slide_sel = extra["slide_sel"]
                             saved_sig = extra.get("signature")
-                            if saved_sig is not None and saved_sig.image_path:
-                                if sig.image_error(saved_sig.image_path):
+                            if saved_sig is not None:
+                                img_err = sig.image_error(saved_sig.image_path)
+                                if img_err:
+                                    QMessageBox.warning(
+                                        self, "Подпись",
+                                        "Факсимильная подпись из сохранённой "
+                                        "разметки не восстановлена: " + img_err +
+                                        ".\nУкажите файл изображения заново.")
                                     saved_sig.image_path = ""
-                                else:
-                                    self.state.signature = saved_sig
-                                    self.chk_sig.setChecked(saved_sig.enabled)
-                                    self._sig_pix = (QPixmap(saved_sig.image_path)
-                                                     if saved_sig.image_path else None)
+                                self.state.signature = saved_sig
+                                self.chk_sig.setChecked(saved_sig.enabled)
+                                self._sig_pix = (QPixmap(saved_sig.image_path)
+                                                 if saved_sig.image_path else None)
                     else:
                         QMessageBox.warning(self, "Разметка", "Тип шаблона в разметке не совпадает.")
                 except Exception as exc:
@@ -405,6 +413,15 @@ class StepTemplate(QWidget):
         choice = self.cmb_slide.itemData(idx)
         self.state.slide_sel = [choice] if isinstance(choice, int) else None
         self._reset_signature_area()
+        if isinstance(choice, int):
+            self._set_page(choice)
+        self._update_sig_ui()
+
+    def _sig_target_ok(self) -> bool:
+        """True when the previewed slide is among the slides the signature
+        will be stamped on (all slides, or the single selected one)."""
+        sel = self.state.slide_sel
+        return sel is None or self._page in sel
 
     def _configure_for_type(self):
         self.cmb_slide.blockSignals(True)
@@ -457,6 +474,8 @@ class StepTemplate(QWidget):
         if not self.state.template_path or self._page_count == 0:
             return
         self._page = max(0, min(idx, self._page_count - 1))
+        if not self._sig_target_ok():
+            self._exit_sig_mode()
         self.lbl_page.setText(f"Страница/слайд {self._page + 1} из {self._page_count}")
         if self.state.template_type == TEMPLATE_PDF:
             png = pdf_engine.render_page_png(self.state.template_path, self._page, dpi=150)
@@ -471,6 +490,7 @@ class StepTemplate(QWidget):
             self.canvas.set_pickable_shapes(self._blocks)
             self._refresh_blocks()
         self._refresh_overlays()
+        self._update_sig_ui()
 
     # ---- fields ----------------------------------------------------------
     def _cur_field(self) -> Field | None:
@@ -747,6 +767,8 @@ class StepTemplate(QWidget):
 
     def _sig_area_toggled(self, on: bool):
         if on:
+            if not self._sig_target_ok():
+                self._set_page(self.state.slide_sel[0])
             self.canvas.set_mode(MODE_SIGNATURE)
             self.btn_sig_area.setText("Готово — вернуться к полям")
         else:
@@ -787,20 +809,33 @@ class StepTemplate(QWidget):
         spec = self.state.signature
         self.lbl_sig_file.setText(
             os.path.basename(spec.image_path) if spec.image_path else "не выбран")
+        on_target = self._sig_target_ok()
         if spec.enabled:
-            if spec.rect:
+            if not on_target:
+                sel = self.state.slide_sel
+                self.lbl_sig_state.setText(
+                    f"Подпись будет размещена на слайде {sel[0] + 1}. "
+                    f"Сейчас показан слайд {self._page + 1} — перейдите на "
+                    "слайд подписи, чтобы задать или изменить область.")
+            elif spec.rect:
                 w = spec.rect[2] - spec.rect[0]
                 h = spec.rect[3] - spec.rect[1]
+                target = (f"слайде {self._page + 1}"
+                          if self.state.slide_sel else "каждом слайде")
                 self.lbl_sig_state.setText(
-                    f"Область задана ({w:.0f} × {h:.0f} pt). Можно двигать "
-                    "рамку и менять её размер в режиме выделения.")
+                    f"Область задана ({w:.0f} × {h:.0f} pt) на {target}. "
+                    "Можно двигать рамку и менять её размер в режиме "
+                    "выделения.")
             else:
+                target = (f"слайда {self._page + 1}"
+                          if self.state.slide_sel else "слайда")
                 self.lbl_sig_state.setText(
                     "Область не задана — нажмите «Выделить область на превью» "
-                    "и растяните рамку мышью. Рекомендуется PNG с прозрачным "
-                    "фоном.")
+                    f"и растяните рамку мышью на {target}. Рекомендуется PNG "
+                    "с прозрачным фоном.")
         self.canvas.set_signature(
-            spec.rect if spec.enabled else None, self._sig_pix)
+            spec.rect if (spec.enabled and on_target) else None,
+            self._sig_pix)
 
     def _reset_signature_area(self):
         """Template or selected slide changed — the stored area no longer

@@ -271,6 +271,16 @@ def generate(
             else:
                 doc_w, doc_h = pdf_engine.page_size_pt(template_path, 0)
             sig_issues = sig.issues(signature, doc_w, doc_h)
+            if not sig_issues and template_type == TEMPLATE_PDF:
+                bad = [i + 1 for i, (pw, ph) in enumerate(
+                    pdf_engine.page_sizes_pt(template_path))
+                    if sig.fit_box(1, 1,
+                                   sig.clamp_rect(signature.rect, pw, ph))[2] <= 0]
+                if bad:
+                    sig_issues.append(
+                        "область подписи не попадает на страницы: "
+                        + ", ".join(map(str, bad))
+                        + " — уменьшите область или отключите подпись")
         except Exception as exc:
             sig_issues = [f"не удалось проверить подпись: {exc}"]
         if sig_issues:
