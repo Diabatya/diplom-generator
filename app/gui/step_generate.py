@@ -13,8 +13,9 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from app.core import excel_reader, pptx_engine
-from app.core.models import TEMPLATE_PPTX
+from app.core import excel_reader, pdf_engine, pptx_engine
+from app.core import signature as sig
+from app.core.models import TEMPLATE_PDF, TEMPLATE_PPTX
 from app.core.generator import (
     EXISTS_OVERWRITE, EXISTS_SKIP, EXISTS_SUFFIX,
     MODE_COMBINED, MODE_SEPARATE, generate, planned_filenames,
@@ -108,6 +109,7 @@ class StepGenerate(QWidget):
         root = QVBoxLayout(self)
         top = QHBoxLayout()
         self.btn_dir = QPushButton("Выбрать папку для результатов…")
+        self.btn_dir.setProperty("secondary", True)
         self.btn_dir.clicked.connect(self._pick_dir)
         self.lbl_dir = QLabel("Папка не выбрана")
         top.addWidget(self.btn_dir)
@@ -119,10 +121,12 @@ class StepGenerate(QWidget):
 
         row = QHBoxLayout()
         self.btn_back = QPushButton("← Назад")
+        self.btn_back.setProperty("secondary", True)
         self.btn_back.clicked.connect(self._go_back)
         self.btn_start = QPushButton("Начать генерацию")
         self.btn_start.clicked.connect(self._start)
         self.btn_cancel = QPushButton("Отменить генерацию")
+        self.btn_cancel.setProperty("secondary", True)
         self.btn_cancel.setEnabled(False)
         self.btn_cancel.clicked.connect(self._cancel)
         row.addWidget(self.btn_back)
@@ -143,9 +147,11 @@ class StepGenerate(QWidget):
 
         tail = QHBoxLayout()
         self.btn_open_dir = QPushButton("Открыть папку с результатами")
+        self.btn_open_dir.setProperty("secondary", True)
         self.btn_open_dir.setEnabled(False)
         self.btn_open_dir.clicked.connect(self._open_dir)
         self.btn_restart = QPushButton("В начало")
+        self.btn_restart.setProperty("secondary", True)
         self.btn_restart.clicked.connect(self._restart)
         tail.addStretch(1)
         tail.addWidget(self.btn_open_dir)
@@ -183,6 +189,20 @@ class StepGenerate(QWidget):
                 issues = [f"Не удалось проверить шаблон: {exc}"]
             if issues:
                 QMessageBox.warning(self, "Привязки", "\n".join(issues))
+                return
+        if self.state.signature.enabled:
+            try:
+                if self.state.template_type == TEMPLATE_PPTX:
+                    prs = pptx_engine.open_template(self.state.template_path)
+                    doc_w, doc_h = prs.slide_width / 12700.0, prs.slide_height / 12700.0
+                else:
+                    doc_w, doc_h = pdf_engine.page_size_pt(
+                        self.state.template_path, 0)
+                sig_issues = sig.issues(self.state.signature, doc_w, doc_h)
+            except Exception as exc:
+                sig_issues = [f"Не удалось проверить подпись: {exc}"]
+            if sig_issues:
+                QMessageBox.warning(self, "Подпись", "\n".join(sig_issues))
                 return
 
         dlg = ModeDialog(self)
@@ -262,6 +282,7 @@ class StepGenerate(QWidget):
             exists_mode=exists_mode,
             first_word=self.state.filename_first_word,
             slide_sel=self.state.slide_sel,
+            signature=self.state.signature,
         )
         self._worker = _Worker(copy.deepcopy(kwargs))
         self._worker.sig_progress.connect(self._on_progress)

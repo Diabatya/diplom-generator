@@ -7,19 +7,22 @@ import os
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QImage, QPixmap
 from PySide6.QtWidgets import (
-    QColorDialog, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
-    QFileDialog, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QMessageBox, QPushButton, QRadioButton,
-    QSplitter, QVBoxLayout, QWidget,
+    QCheckBox, QColorDialog, QComboBox, QDialog, QDialogButtonBox,
+    QDoubleSpinBox, QFileDialog, QGroupBox, QHBoxLayout, QInputDialog,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
+    QPushButton, QRadioButton, QSplitter, QVBoxLayout, QWidget,
 )
 
 from app.core import mapping_io, pdf_engine, pptx_engine
+from app.core import signature as sig
 from app.core.fonts import list_system_fonts
 from app.core.models import (
     ALIGN_CENTER, ALIGN_LEFT, ALIGN_RIGHT, Field, PdfPlacement,
-    PptxPlacement, TEMPLATE_PDF, TEMPLATE_PPTX,
+    PptxPlacement, SignatureSpec, TEMPLATE_PDF, TEMPLATE_PPTX,
 )
-from app.gui.canvas import MODE_DRAW, MODE_EYEDROP, MODE_PICK, PreviewCanvas
+from app.gui.canvas import (
+    MODE_DRAW, MODE_EYEDROP, MODE_PICK, MODE_SIGNATURE, PreviewCanvas,
+)
 from app.gui import pptx_render
 from app.gui.state import AppState
 
@@ -109,16 +112,21 @@ class StepTemplate(QWidget):
         self._doc_h = 0.0
         self._blocks: list[dict] = []  # pptx text blocks on current slide
         self._loading_style = False
+        self._sig_pix: QPixmap | None = None  # signature preview image
 
         root = QVBoxLayout(self)
         top = QHBoxLayout()
         self.btn_open = QPushButton("Выбрать файл шаблона (.pptx или .pdf)…")
+        self.btn_open.setProperty("secondary", True)
         self.btn_open.clicked.connect(self._open_template)
         self.lbl_template = QLabel("Шаблон не выбран")
         top.addWidget(self.btn_open)
         top.addWidget(self.lbl_template, 1)
         root.addLayout(top)
-        self.lbl_preview = QLabel("PPTX: предпросмотр приблизительный — точный вид проверьте в PowerPoint.")
+        self.lbl_preview = QLabel(
+            "PPTX: предпросмотр показывает фон и графику макета, но является "
+            "приблизительным — финальный вид проверьте через «Пример» и в "
+            "PowerPoint.")
         root.addWidget(self.lbl_preview)
         self.cmb_slide = QComboBox()
         self.cmb_slide.setVisible(False)
@@ -145,6 +153,7 @@ class StepTemplate(QWidget):
         self.canvas.sigRectDrawn.connect(self._on_rect_drawn)
         self.canvas.sigShapePicked.connect(self._on_shape_picked)
         self.canvas.sigPointClicked.connect(self._on_eyedrop)
+        self.canvas.sigSignatureChanged.connect(self._on_signature_rect)
         lv.addWidget(self.canvas, 1)
         split.addWidget(left)
 
@@ -158,7 +167,9 @@ class StepTemplate(QWidget):
         rv.addWidget(self.lst_fields, 1)
         fbtns = QHBoxLayout()
         self.btn_add_field = QPushButton("Добавить поле…")
+        self.btn_add_field.setProperty("secondary", True)
         self.btn_del_field = QPushButton("Удалить поле")
+        self.btn_del_field.setProperty("secondary", True)
         self.btn_add_field.clicked.connect(self._add_field)
         self.btn_del_field.clicked.connect(self._del_field)
         fbtns.addWidget(self.btn_add_field)
@@ -178,9 +189,52 @@ class StepTemplate(QWidget):
         self.lst_places.currentRowChanged.connect(self._on_place_selected)
         bv.addWidget(self.lst_places, 1)
         self.btn_del_place = QPushButton("Удалить выбранное место")
+        self.btn_del_place.setProperty("secondary", True)
         self.btn_del_place.clicked.connect(self._del_place)
         bv.addWidget(self.btn_del_place)
         rv.addWidget(self.grp_bind, 2)
+
+        # Facsimile signature
+        self.grp_sig = QGroupBox("Факсимильная подпись")
+        gv = QVBoxLayout(self.grp_sig)
+        self.chk_sig = QCheckBox("Добавить подпись на все дипломы")
+        self.chk_sig.toggled.connect(self._sig_toggled)
+        gv.addWidget(self.chk_sig)
+        srow = QHBoxLayout()
+        self.btn_sig_file = QPushButton("Файл изображения…")
+        self.btn_sig_file.setProperty("secondary", True)
+        self.btn_sig_file.setToolTip(
+            "PNG с прозрачным фоном или JPEG; рекомендуется прозрачный PNG")
+        self.btn_sig_file.clicked.connect(self._pick_sig_file)
+        self.lbl_sig_file = QLabel("не выбран")
+        srow.addWidget(self.btn_sig_file)
+        srow.addWidget(self.lbl_sig_file, 1)
+        gv.addLayout(srow)
+        arow = QHBoxLayout()
+        self.btn_sig_area = QPushButton("Выделить область на превью")
+        self.btn_sig_area.setProperty("secondary", True)
+        self.btn_sig_area.setCheckable(True)
+        self.btn_sig_area.setToolTip(
+            "Растяните рамку мышью; затем её можно двигать и менять размер "
+            "за нижний правый угол")
+        self.btn_sig_area.toggled.connect(self._sig_area_toggled)
+        self.btn_sig_clear = QPushButton("Убрать")
+        self.btn_sig_clear.setProperty("secondary", True)
+        self.btn_sig_clear.clicked.connect(self._clear_signature)
+        arow.addWidget(self.btn_sig_area, 1)
+        arow.addWidget(self.btn_sig_clear)
+        gv.addLayout(arow)
+        self.lbl_sig_state = QLabel(
+            "Рекомендуется PNG с прозрачным фоном. Область задаётся на "
+            "превью слайда; при смене шаблона или исходного слайда её нужно "
+            "выделить заново.")
+        self.lbl_sig_state.setWordWrap(True)
+        gv.addWidget(self.lbl_sig_state)
+        self._sig_controls = [self.btn_sig_file, self.btn_sig_area,
+                            self.btn_sig_clear]
+        self._set_sig_controls_enabled(False)
+        self.grp_sig.setEnabled(False)
+        rv.addWidget(self.grp_sig)
 
         # PDF style box
         self.grp_style = QGroupBox("Стиль текста (для PDF-рамок)")
@@ -190,6 +244,7 @@ class StepTemplate(QWidget):
         self.cmb_font.setEditable(False)
         sv.addWidget(self.cmb_font)
         self.btn_custom_font = QPushButton("Указать свой .ttf файл…")
+        self.btn_custom_font.setProperty("secondary", True)
         self.btn_custom_font.clicked.connect(self._pick_custom_font)
         sv.addWidget(self.btn_custom_font)
         row = QHBoxLayout()
@@ -206,6 +261,7 @@ class StepTemplate(QWidget):
         row.addWidget(self.cmb_align)
         sv.addLayout(row)
         self.btn_color = QPushButton("Цвет текста…")
+        self.btn_color.setProperty("secondary", True)
         self._color = "#000000"
         self.btn_color.clicked.connect(self._pick_color)
         sv.addWidget(self.btn_color)
@@ -217,8 +273,10 @@ class StepTemplate(QWidget):
         frow.addWidget(self.cmb_fill, 1)
         self._fill_color = "#FFFFFF"
         self.btn_fill_color = QPushButton("Цвет…")
+        self.btn_fill_color.setProperty("secondary", True)
         self.btn_fill_color.clicked.connect(self._pick_fill_color)
         self.btn_fill_pick = QPushButton("Пипетка")
+        self.btn_fill_pick.setProperty("secondary", True)
         self.btn_fill_pick.setToolTip(
             "Кликните по превью, чтобы взять цвет плашки под текстом")
         self.btn_fill_pick.clicked.connect(self._start_eyedrop)
@@ -239,6 +297,7 @@ class StepTemplate(QWidget):
         self._fill_mode_changed(0)
 
         self.btn_save_map = QPushButton("Сохранить разметку (.mapping.json)")
+        self.btn_save_map.setProperty("secondary", True)
         self.btn_save_map.clicked.connect(self._save_mapping)
         self.btn_save_map.setEnabled(False)
         rv.addWidget(self.btn_save_map)
@@ -285,6 +344,12 @@ class StepTemplate(QWidget):
         self.state.filename_source = ("auto", None)
         self.state.filename_first_word = False
         self.state.slide_sel = [0] if ext == ".pptx" and self._page_count > 1 else None
+        self.state.signature = SignatureSpec()
+        self._sig_pix = None
+        self.chk_sig.setChecked(False)
+        self.grp_sig.setEnabled(True)
+        self._exit_sig_mode()
+        self._update_sig_ui()
         self._page = 0
         self.lbl_template.setText(os.path.basename(path))
         self.btn_save_map.setEnabled(True)
@@ -318,6 +383,20 @@ class StepTemplate(QWidget):
                                 self.state.filename_first_word = extra["filename_first_word"]
                             if "slide_sel" in extra:
                                 self.state.slide_sel = extra["slide_sel"]
+                            saved_sig = extra.get("signature")
+                            if saved_sig is not None:
+                                img_err = sig.image_error(saved_sig.image_path)
+                                if img_err:
+                                    QMessageBox.warning(
+                                        self, "Подпись",
+                                        "Факсимильная подпись из сохранённой "
+                                        "разметки не восстановлена: " + img_err +
+                                        ".\nУкажите файл изображения заново.")
+                                    saved_sig.image_path = ""
+                                self.state.signature = saved_sig
+                                self.chk_sig.setChecked(saved_sig.enabled)
+                                self._sig_pix = (QPixmap(saved_sig.image_path)
+                                                 if saved_sig.image_path else None)
                     else:
                         QMessageBox.warning(self, "Разметка", "Тип шаблона в разметке не совпадает.")
                 except Exception as exc:
@@ -326,12 +405,23 @@ class StepTemplate(QWidget):
         self._configure_for_type()
         self._set_page(0)
         self._refresh_fields()
+        self._update_sig_ui()
 
     def _slide_choice_changed(self, idx: int):
         if idx < 0:
             return
         choice = self.cmb_slide.itemData(idx)
         self.state.slide_sel = [choice] if isinstance(choice, int) else None
+        self._reset_signature_area()
+        if isinstance(choice, int):
+            self._set_page(choice)
+        self._update_sig_ui()
+
+    def _sig_target_ok(self) -> bool:
+        """True when the previewed slide is among the slides the signature
+        will be stamped on (all slides, or the single selected one)."""
+        sel = self.state.slide_sel
+        return sel is None or self._page in sel
 
     def _configure_for_type(self):
         self.cmb_slide.blockSignals(True)
@@ -384,6 +474,8 @@ class StepTemplate(QWidget):
         if not self.state.template_path or self._page_count == 0:
             return
         self._page = max(0, min(idx, self._page_count - 1))
+        if not self._sig_target_ok():
+            self._exit_sig_mode()
         self.lbl_page.setText(f"Страница/слайд {self._page + 1} из {self._page_count}")
         if self.state.template_type == TEMPLATE_PDF:
             png = pdf_engine.render_page_png(self.state.template_path, self._page, dpi=150)
@@ -398,6 +490,7 @@ class StepTemplate(QWidget):
             self.canvas.set_pickable_shapes(self._blocks)
             self._refresh_blocks()
         self._refresh_overlays()
+        self._update_sig_ui()
 
     # ---- fields ----------------------------------------------------------
     def _cur_field(self) -> Field | None:
@@ -657,6 +750,101 @@ class StepTemplate(QWidget):
             if warn else "")
         self.lbl_fill_warn.setVisible(bool(warn))
 
+    # ---- facsimile signature ---------------------------------------------
+    def _set_sig_controls_enabled(self, on: bool):
+        for w in self._sig_controls:
+            w.setEnabled(on)
+
+    def _normal_canvas_mode(self) -> str:
+        return MODE_DRAW if self.state.template_type == TEMPLATE_PDF else MODE_PICK
+
+    def _sig_toggled(self, on: bool):
+        self.state.signature.enabled = on
+        self._set_sig_controls_enabled(on)
+        if not on:
+            self._exit_sig_mode()
+        self._update_sig_ui()
+
+    def _sig_area_toggled(self, on: bool):
+        if on:
+            if not self._sig_target_ok():
+                self._set_page(self.state.slide_sel[0])
+            self.canvas.set_mode(MODE_SIGNATURE)
+            self.btn_sig_area.setText("Готово — вернуться к полям")
+        else:
+            self.canvas.set_mode(self._normal_canvas_mode())
+            self.btn_sig_area.setText("Выделить область на превью")
+
+    def _exit_sig_mode(self):
+        if self.btn_sig_area.isChecked():
+            self.btn_sig_area.setChecked(False)
+        else:
+            self.canvas.set_mode(self._normal_canvas_mode())
+
+    def _pick_sig_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Изображение подписи", "",
+            "Изображения (*.png *.jpg *.jpeg)")
+        if not path:
+            return
+        err = sig.image_error(path)
+        if err:
+            QMessageBox.warning(self, "Подпись", err)
+            return
+        self.state.signature.image_path = path
+        self._sig_pix = QPixmap(path)
+        self._update_sig_ui()
+
+    def _on_signature_rect(self, x0, y0, x1, y1):
+        self.state.signature.rect = (x0, y0, x1, y1)
+        self._update_sig_ui()
+
+    def _clear_signature(self):
+        self.state.signature = SignatureSpec()
+        self._sig_pix = None
+        self.chk_sig.setChecked(False)
+        self._update_sig_ui()
+
+    def _update_sig_ui(self):
+        spec = self.state.signature
+        self.lbl_sig_file.setText(
+            os.path.basename(spec.image_path) if spec.image_path else "не выбран")
+        on_target = self._sig_target_ok()
+        if spec.enabled:
+            if not on_target:
+                sel = self.state.slide_sel
+                self.lbl_sig_state.setText(
+                    f"Подпись будет размещена на слайде {sel[0] + 1}. "
+                    f"Сейчас показан слайд {self._page + 1} — перейдите на "
+                    "слайд подписи, чтобы задать или изменить область.")
+            elif spec.rect:
+                w = spec.rect[2] - spec.rect[0]
+                h = spec.rect[3] - spec.rect[1]
+                target = (f"слайде {self._page + 1}"
+                          if self.state.slide_sel else "каждом слайде")
+                self.lbl_sig_state.setText(
+                    f"Область задана ({w:.0f} × {h:.0f} pt) на {target}. "
+                    "Можно двигать рамку и менять её размер в режиме "
+                    "выделения.")
+            else:
+                target = (f"слайда {self._page + 1}"
+                          if self.state.slide_sel else "слайда")
+                self.lbl_sig_state.setText(
+                    "Область не задана — нажмите «Выделить область на превью» "
+                    f"и растяните рамку мышью на {target}. Рекомендуется PNG "
+                    "с прозрачным фоном.")
+        self.canvas.set_signature(
+            spec.rect if (spec.enabled and on_target) else None,
+            self._sig_pix)
+
+    def _reset_signature_area(self):
+        """Template or selected slide changed — the stored area no longer
+        applies; ask the user to draw it again."""
+        spec = self.state.signature
+        if spec.rect is not None:
+            spec.rect = None
+            self._update_sig_ui()
+
     # ---- save / next --------------------------------------------------------
     def _save_mapping(self):
         if not self.state.template_path:
@@ -667,6 +855,7 @@ class StepTemplate(QWidget):
                 filename_source=self.state.filename_source,
                 filename_first_word=self.state.filename_first_word,
                 slide_sel=self.state.slide_sel,
+                signature=self.state.signature,
             )
             QMessageBox.information(self, "Разметка", f"Разметка сохранена:\n{path}")
         except Exception as exc:
@@ -685,6 +874,10 @@ class StepTemplate(QWidget):
             if issues:
                 QMessageBox.warning(self, "Привязки", "\n".join(issues))
                 return
+        sig_issues = sig.issues(self.state.signature, self._doc_w, self._doc_h)
+        if sig_issues:
+            QMessageBox.warning(self, "Подпись", "\n".join(sig_issues))
+            return
         empty = [f.name for f in self.state.fields if not f.placements]
         if empty:
             ans = QMessageBox.question(

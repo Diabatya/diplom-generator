@@ -15,7 +15,8 @@ except ImportError:  # older PyMuPDF
     import fitz  # type: ignore  # PyMuPDF
 
 from . import fonts as fontlib
-from .models import Field, PdfPlacement
+from . import signature as sig
+from .models import Field, PdfPlacement, SignatureSpec
 
 
 
@@ -192,15 +193,53 @@ def _apply_placements(doc: fitz.Document, fields: list[Field], values: dict[str,
     return notes
 
 
-def render_pdf_doc(template_path: str, fields: list[Field], values: dict[str, str]):
+def _apply_signature(doc: fitz.Document, spec: SignatureSpec | None) -> list[str]:
+    """Stamp the facsimile image on every page, aspect-fit inside the
+    stored rect (PDF points, visible/rotated page coordinates).
+    PNG transparency is preserved. Returns per-page review notes."""
+    notes: list[str] = []
+    if spec is None or not spec.enabled or spec.rect is None:
+        return notes
+    iw, ih = sig.image_size_px(spec.image_path)
+    for page in doc:
+        clamped = sig.clamp_rect(spec.rect, page.rect.width, page.rect.height)
+        x, y, w, h = sig.fit_box(iw, ih, clamped)
+        if w <= 0 or h <= 0:
+            notes.append(
+                f"страница {page.number + 1}: область подписи не попадает "
+                "на страницу — подпись пропущена")
+            continue
+        # insert_image works in unrotated storage coordinates; the stored
+        # rect is in the visible frame, so derotate it. The image itself is
+        # rotated by page.rotation so it appears upright in the view.
+        vrect = fitz.Rect(x, y, x + w, y + h)
+        urect = vrect * page.derotation_matrix
+        page.insert_image(urect, filename=spec.image_path,
+                          keep_proportion=False, rotate=page.rotation)
+    return notes
+
+
+def page_sizes_pt(path: str) -> list[tuple[float, float]]:
+    """Visible (rotation-aware) size of every page in points."""
+    out = []
+    with fitz.open(path) as doc:
+        for page in doc:
+            out.append((page.rect.width, page.rect.height))
+    return out
+
+
+def render_pdf_doc(template_path: str, fields: list[Field], values: dict[str, str],
+                   signature: SignatureSpec | None = None):
     """Return an in-memory edited document plus review notes."""
     doc = fitz.open(template_path)
     notes = _apply_placements(doc, fields, values)
+    notes += _apply_signature(doc, signature)
     return doc, notes
 
 
-def render_single(template_path: str, fields: list[Field], values: dict[str, str], out_path: str):
-    doc, notes = render_pdf_doc(template_path, fields, values)
+def render_single(template_path: str, fields: list[Field], values: dict[str, str], out_path: str,
+                  signature: SignatureSpec | None = None):
+    doc, notes = render_pdf_doc(template_path, fields, values, signature)
     try:
         doc.save(out_path, garbage=4, deflate=True)
     finally:

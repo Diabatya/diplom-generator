@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 
-from .models import Field, TEMPLATE_PDF, TEMPLATE_PPTX
+from .models import Field, SignatureSpec, TEMPLATE_PDF, TEMPLATE_PPTX
 
 MAPPING_VERSION = 1
 
@@ -26,6 +26,7 @@ def save_mapping(
     filename_source: tuple | None = None,
     filename_first_word: bool | None = None,
     slide_sel: list[int] | None = None,
+    signature: SignatureSpec | None = None,
 ) -> str:
     path = mapping_path_for(template_path)
     data = {
@@ -40,6 +41,8 @@ def save_mapping(
         data["filename_first_word"] = bool(filename_first_word)
     if slide_sel is not None:
         data["slide_sel"] = slide_sel
+    if signature is not None:
+        data["signature"] = signature.to_dict()
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(data, fh, ensure_ascii=False, indent=2)
     return path
@@ -66,4 +69,6 @@ def load_mapping(template_path: str) -> tuple[str, list[Field], dict]:
         extra["filename_first_word"] = bool(data["filename_first_word"])
     if isinstance(data.get("slide_sel"), list):
         extra["slide_sel"] = [int(i) for i in data["slide_sel"]]
+    if isinstance(data.get("signature"), dict):
+        extra["signature"] = SignatureSpec.from_dict(data["signature"])
     return ttype, fields, extra

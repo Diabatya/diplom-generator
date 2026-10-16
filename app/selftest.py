@@ -122,6 +122,28 @@ def main():
                    os.path.join(tmp, "pptx_out"), MODE_SEPARATE, 0, set())
     _check("pptx generation", len(rep["created"]) == 2,
            str([c[1] for c in rep["created"]]))
+
+    # ---- facsimile signature -------------------------------------------
+    from app.core.models import SignatureSpec
+    try:
+        import pymupdf as fitz
+    except ImportError:
+        import fitz  # type: ignore
+    sig_png = os.path.join(tmp, "sig.png")
+    pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 120, 50))
+    pix.clear_with(30)
+    pix.save(sig_png)
+    spec = SignatureSpec(True, sig_png, (400, 480, 700, 545))
+    rep_sig = generate(pptx_path, TEMPLATE_PPTX, fields, cm, rows,
+                       os.path.join(tmp, "pptx_sig"), MODE_SEPARATE, 0, set(),
+                       signature=spec)
+    sig_pics = [s for s in Presentation(
+        os.path.join(tmp, "pptx_sig", rep_sig["created"][0][1])
+    ).slides[0].shapes
+        if s.name == pptx_engine.SIGNATURE_PICTURE_NAME] \
+        if rep_sig["created"] else []
+    _check("pptx signature stamped", len(rep_sig["created"]) == 2
+           and len(sig_pics) == 1, str(sig_pics))
     if rep["created"]:
         texts = [sh.text_frame.text
                  for sh in Presentation(
@@ -169,6 +191,14 @@ def main():
         from PySide6.QtWidgets import QApplication
         app = QApplication.instance() or QApplication(["selftest"])
         _check("Qt platform plugin loads (offscreen)", app is not None)
+        from app.gui.help_dialog import HELP_HTML
+        from app.gui.main_window import MainWindow
+        mw = MainWindow()
+        _check("built-in help available",
+               "Как пользоваться" in HELP_HTML
+               and mw.btn_help.text() == "?"
+               and mw.btn_help.toolTip() == "Инструкция")
+        mw.close()
         app.quit()
     except Exception as e:
         _check("Qt platform plugin loads (offscreen)", False, repr(e))

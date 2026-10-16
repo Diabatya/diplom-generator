@@ -20,10 +20,13 @@ from pptx.opc.constants import RELATIONSHIP_TYPE as RT
 from pptx.util import Emu, Pt
 
 from . import fonts as fontlib
-from .models import Field, PptxPlacement
+from . import signature as sig
+from .models import Field, PptxPlacement, SignatureSpec
 
 EMU_PER_PT = 12700.0
 _REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+
+SIGNATURE_PICTURE_NAME = "FacsimileSignature"
 
 _TOKEN_RE = re.compile(r"(@{2,}[^@\n]+@{2,})")
 
@@ -651,6 +654,39 @@ def save_prs(prs: Presentation, path_or_buf) -> None:
     prs.save(path_or_buf)
 
 
+def add_signature_to_slide(slide, spec: SignatureSpec,
+                           doc_w_pt: float, doc_h_pt: float) -> None:
+    """Stamp the facsimile image on ``slide`` aspect-fit inside
+    ``spec.rect`` (document points). Idempotent: an existing signature
+    picture is replaced, not duplicated."""
+    for shp in list(slide.shapes):
+        if shp.name == SIGNATURE_PICTURE_NAME:
+            shp.element.getparent().remove(shp.element)
+    if spec.rect is None:
+        return
+    x0, y0, x1, y1 = sig.clamp_rect(spec.rect, doc_w_pt, doc_h_pt)
+    iw, ih = sig.image_size_px(spec.image_path)
+    fx, fy, fw, fh = sig.fit_box(iw, ih, (x0, y0, x1, y1))
+    if fw <= 0 or fh <= 0:
+        return
+    pic = slide.shapes.add_picture(
+        spec.image_path,
+        Emu(int(fx * EMU_PER_PT)), Emu(int(fy * EMU_PER_PT)),
+        Emu(int(fw * EMU_PER_PT)), Emu(int(fh * EMU_PER_PT)))
+    pic.name = SIGNATURE_PICTURE_NAME
+
+
+def add_signature(prs: Presentation, spec: SignatureSpec | None) -> None:
+    """Stamp the signature on every slide of ``prs`` at identical
+    coordinates. ``None``/disabled spec is a no-op."""
+    if spec is None or not spec.enabled:
+        return
+    doc_w = prs.slide_width / EMU_PER_PT
+    doc_h = prs.slide_height / EMU_PER_PT
+    for slide in prs.slides:
+        add_signature_to_slide(slide, spec, doc_w, doc_h)
+
+
 def _drop_all_but(prs: Presentation, orig_sld_ids, keep: set[int]):
     """Remove unselected ORIGINAL slides (by their index in the template)
     from the presentation's slide list and relationships."""
@@ -673,16 +709,19 @@ def _selected_indexes(prs: Presentation, slide_sel) -> list[int]:
 
 
 def render_single(template_path: str, fields: list[Field], values: dict[str, str],
-                  out_path: str, slide_sel=None):
+                  out_path: str, slide_sel=None,
+                  signature: SignatureSpec | None = None):
     """Generate one PPTX file for one data row. Returns review notes.
 
     ``slide_sel`` limits the output to the given template slides (original
-    indexes); None keeps the whole deck."""
+    indexes); None keeps the whole deck. ``signature`` (if enabled) is
+    stamped on every output slide."""
     prs = Presentation(template_path)
     notes = substitute(prs, fields, values)
     if slide_sel is not None:
         keep = set(_selected_indexes(prs, slide_sel))
         _drop_all_but(prs, list(prs.slides._sldIdLst), keep)
+    add_signature(prs, signature)
     prs.save(out_path)
     return notes
 
@@ -751,6 +790,7 @@ def duplicate_slide(prs: Presentation, slide):
 def render_combined(
     template_path: str, fields: list[Field], rows_values: list[dict[str, str]],
     out_path: str, slide_sel=None, progress_cb=None, cancel_cb=None,
+    signature: SignatureSpec | None = None,
 ):
     """One PPTX where each data row contributes a copy of the selected
     template slides (``slide_sel`` = original indexes; None = whole deck).
@@ -802,5 +842,6 @@ def render_combined(
         sld_ids.remove(sld_id)
     for sld_id in ordered:
         sld_ids.append(sld_id)
+    add_signature(prs, signature)
     prs.save(out_path)
     return notes_per_row

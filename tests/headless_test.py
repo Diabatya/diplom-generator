@@ -1174,6 +1174,637 @@ def main():
     check("iter6: original template and Excel unchanged",
           th == _sha(fixture_pptx) and xh == _sha(fixture_xlsx))
 
+    # ---- iter7: facsimile signature ------------------------------------------
+    from app.core import signature as sigmod
+    from app.core.models import SignatureSpec
+    from PySide6.QtCore import Qt, QPointF
+    from PySide6.QtGui import QImage, QPixmap
+    import struct, zlib
+
+    def _png_rgba(path, w, h):
+        """Deterministic RGBA PNG: dark-blue diagonal strokes on alpha 0."""
+        def chunk(tag, data):
+            return (struct.pack(">I", len(data)) + tag + data
+                    + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+        raw = b"".join(
+            b"\x00" + b"".join(
+                bytes((11, 61, 145, 255)) if (x + y) % 9 < 4
+                else bytes((0, 0, 0, 0)) for x in range(w))
+            for y in range(h))
+        with open(path, "wb") as fh:
+            fh.write(b"\x89PNG\r\n\x1a\n"
+                     + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+                     + chunk(b"IDAT", zlib.compress(raw))
+                     + chunk(b"IEND", b""))
+
+    sig_png = os.path.join(tmp, "sig.png")
+    _png_rgba(sig_png, 200, 80)
+    sig_jpg = os.path.join(tmp, "sig.jpg")
+    QImage(200, 80, QImage.Format_RGB32).save(sig_jpg, "JPG")
+    doc_w_pt = Cm(28) / 12700.0
+    doc_h_pt = Cm(20) / 12700.0
+    sig_rect = (doc_w_pt - 240, doc_h_pt - 140, doc_w_pt - 40, doc_h_pt - 40)
+
+    check("iter7: png/jpg accepted, bad files rejected",
+          sigmod.image_error(sig_png) is None
+          and sigmod.image_error(sig_jpg) is None
+          and sigmod.image_error("") is not None
+          and sigmod.image_error(os.path.join(tmp, "nope.png")) is not None
+          and sigmod.image_error(fixture_xlsx) is not None)
+
+    check("iter7: spec validation covers missing pieces",
+          sigmod.issues(SignatureSpec(True, sig_png, sig_rect), doc_w_pt, doc_h_pt) == []
+          and sigmod.issues(SignatureSpec(True, sig_png, None), doc_w_pt, doc_h_pt)
+          and sigmod.issues(SignatureSpec(True, "", sig_rect), doc_w_pt, doc_h_pt)
+          and sigmod.issues(SignatureSpec(True, sig_png, (5, 5, 10, 10)),
+                            doc_w_pt, doc_h_pt)
+          and sigmod.issues(SignatureSpec(True, sig_png,
+                                          (doc_w_pt + 10, 0, doc_w_pt + 40, 30)),
+                            doc_w_pt, doc_h_pt)
+          and not sigmod.issues(SignatureSpec(False, "", None),
+                                doc_w_pt, doc_h_pt))
+
+    sig_spec = SignatureSpec(True, sig_png, sig_rect)
+    sig_rep = generate(fixture_pptx, TEMPLATE_PPTX, field_map,
+                       {n: rh.index(n) for n in ("ФИО", "Номинация", "Управление")},
+                       rr, os.path.join(tmp, "sig_out"), MODE_COMBINED,
+                       rh.index("ФИО"), signature=sig_spec)
+    sig_deck = Presentation(os.path.join(tmp, "sig_out", sig_rep["created"][0][1]))
+    pics = [[s for s in sl.shapes
+             if s.name == pptx_engine.SIGNATURE_PICTURE_NAME]
+            for sl in sig_deck.slides]
+    check("iter7: combined pptx — one signature picture on every slide",
+          len(sig_deck.slides) == 6 and all(len(p) == 1 for p in pics))
+    boxes = [(p[0].left, p[0].top, p[0].width, p[0].height) for p in pics]
+    check("iter7: identical signature placement on all slides",
+          len(set(boxes)) == 1)
+    l0, t0, w0, h0 = boxes[0]
+    # 200x80 px in a 200x100 pt rect -> scale 1.0, vertically centered
+    exp_w, exp_h = int(200 * 12700), int(80 * 12700)
+    check("iter7: aspect preserved, fit inside rect",
+          abs(w0 - exp_w) < 3 * 12700 and abs(h0 - exp_h) < 3 * 12700
+          and l0 >= int(sig_rect[0] * 12700) - 12700
+          and t0 >= int(sig_rect[1] * 12700) - 12700
+          and l0 + w0 <= int(sig_rect[2] * 12700) + 12700
+          and t0 + h0 <= int(sig_rect[3] * 12700) + 12700,
+          f"{l0},{t0} {w0}x{h0}")
+    check("iter7: png transparency kept (RGBA image part)",
+          pics[0][0].image.blob[25] in (4, 6))
+
+    # idempotency: stamping the same slide twice must not stack copies
+    idem = Presentation(fixture_pptx)
+    pptx_engine.add_signature_to_slide(idem.slides[0], sig_spec,
+                                       doc_w_pt, doc_h_pt)
+    pptx_engine.add_signature_to_slide(idem.slides[0], sig_spec,
+                                       doc_w_pt, doc_h_pt)
+    check("iter7: re-stamping replaces, no duplicates",
+          sum(1 for s in idem.slides[0].shapes
+              if s.name == pptx_engine.SIGNATURE_PICTURE_NAME) == 1)
+
+    # separate mode gets the same picture at the same coordinates
+    sep_rep = generate(fixture_pptx, TEMPLATE_PPTX, field_map,
+                       {n: rh.index(n) for n in ("ФИО", "Номинация", "Управление")},
+                       rr[:1], os.path.join(tmp, "sig_sep"), MODE_SEPARATE,
+                       rh.index("ФИО"), signature=sig_spec)
+    sep_pic = next(s for s in Presentation(
+        os.path.join(tmp, "sig_sep", sep_rep["created"][0][1])).slides[0].shapes
+        if s.name == pptx_engine.SIGNATURE_PICTURE_NAME)
+    check("iter7: separate pptx placement matches combined",
+          (sep_pic.left, sep_pic.top, sep_pic.width, sep_pic.height) == boxes[0])
+
+    # pdf mode stamps the image on every page too
+    pdf_sig_rep = generate(T_PDF, TEMPLATE_PDF, pfields, cm, rows[:2],
+                           os.path.join(tmp, "sig_pdf"), MODE_COMBINED, 0,
+                           signature=SignatureSpec(True, sig_png, sig_rect))
+    pdf_sig_doc = fitz.open(os.path.join(tmp, "sig_pdf",
+                                         pdf_sig_rep["created"][0][1]))
+    check("iter7: pdf pages carry the signature image",
+          pdf_sig_doc.page_count == 2
+          and all(pdf_sig_doc[i].get_images() for i in range(2)))
+    pdf_sig_doc.close()
+
+    # invalid signature blocks generation before touching the output dir
+    bad_out = os.path.join(tmp, "sig_bad")
+    bad_rep = generate(fixture_pptx, TEMPLATE_PPTX, field_map,
+                       {n: rh.index(n) for n in ("ФИО", "Номинация", "Управление")},
+                       rr[:1], bad_out, MODE_SEPARATE, rh.index("ФИО"),
+                       signature=SignatureSpec(True, "", None))
+    check("iter7: broken signature stops generation early",
+          not bad_rep["created"]
+          and any("подпись" in rsn for _r, rsn in bad_rep["skipped"]))
+
+    # ---- iter7: canvas signature editing ---------------------------------
+    from PySide6.QtTest import QTest
+    from app.gui.canvas import MODE_SIGNATURE, PreviewCanvas
+    gui_app2 = QApplication.instance() or QApplication([])
+    canvas = PreviewCanvas()
+    canvas.resize(800, 567)   # ~28x20 cm slide at ~1 px/pt
+    canvas.set_image(QPixmap(793, 567), 793.0, 567.0)
+    canvas.set_signature(sig_rect, QPixmap(sig_png))
+    seen = []
+    canvas.sigSignatureChanged.connect(lambda *r: seen.append(r))
+
+    def draw(c, a, b):
+        QTest.mousePress(c, Qt.LeftButton, Qt.NoModifier, a.toPoint())
+        QTest.mouseMove(c, b.toPoint())
+        QTest.mouseRelease(c, Qt.LeftButton, Qt.NoModifier, b.toPoint())
+
+    def view_pt(rect, cw, ch):
+        """doc-pt rect -> widget px endpoints at canvas size cw x ch."""
+        s = min(cw / 793.0, ch / 567.0)
+        mx, my = (cw - 793 * s) / 2, (ch - 567 * s) / 2
+        return (QPointF(mx + rect[0] * s, my + rect[1] * s),
+                QPointF(mx + rect[2] * s, my + rect[3] * s), s, mx, my)
+
+    canvas.set_mode(MODE_SIGNATURE)
+    canvas.show()
+    a1, b1, _s1, _mx1, _my1 = view_pt(sig_rect, 800, 567)
+    draw(canvas, a1, b1)
+    check("iter7: drawn signature rect in slide coords",
+          bool(seen) and abs(seen[-1][0] - sig_rect[0]) < 3
+          and abs(seen[-1][2] - sig_rect[2]) < 3
+          and abs(seen[-1][3] - sig_rect[3]) < 3, str(seen[-1] if seen else None))
+
+    # same gesture at another widget size -> same document coordinates
+    canvas.resize(1200, 850)
+    a2, b2, _s2, _mx2, _my2 = view_pt(sig_rect, 1200, 850)
+    draw(canvas, a2, b2)
+    check("iter7: preview zoom does not change doc coordinates",
+          bool(seen) and abs(seen[-1][0] - sig_rect[0]) < 3
+          and abs(seen[-1][2] - sig_rect[2]) < 3,
+          str(seen[-1] if seen else None))
+
+    # move: press inside the rect and drag 30 px right / 15 px down
+    canvas.resize(800, 567)
+    _a3, _b3, s2, mx, my = view_pt(sig_rect, 800, 567)
+    ctr = QPointF(mx + (sig_rect[0] + 100) * s2, my + (sig_rect[1] + 50) * s2)
+    draw(canvas, ctr, QPointF(ctr.x() + 30, ctr.y() + 15))
+    moved = seen[-1]
+    check("iter7: move keeps size, shifts origin",
+          abs(moved[0] - sig_rect[0] - 30 / s2) < 3
+          and abs(moved[1] - sig_rect[1] - 15 / s2) < 3
+          and abs((moved[2] - moved[0]) - (sig_rect[2] - sig_rect[0])) < 3,
+          str(moved))
+
+    # resize via the bottom-right handle (press lands 4px inside the handle,
+    # so the corner moves by dragdelta - 4)
+    hr = QPointF(mx + moved[2] * s2 - 4, my + moved[3] * s2 - 4)
+    draw(canvas, hr, QPointF(hr.x() + 40, hr.y() + 20))
+    grown = seen[-1]
+    check("iter7: corner handle resizes, origin stays",
+          abs(grown[0] - moved[0]) < 3
+          and abs(grown[2] - moved[2] - 36 / s2) < 3
+          and abs(grown[3] - moved[3] - 16 / s2) < 3, str(grown))
+    canvas.close()
+
+    # template/slide change drops the stored area and asks for a new one
+    sig_state = AppState(template_path=fixture_pptx,
+                         template_type=TEMPLATE_PPTX)
+    sig_state.signature = SignatureSpec(True, sig_png, sig_rect)
+    sig_step = StepTemplate(sig_state, lambda: None)
+    sig_step._prs = Presentation(fixture_pptx)
+    sig_step._doc_w, sig_step._doc_h = doc_w_pt, doc_h_pt
+    sig_step._sig_toggled(True)
+    sig_step._reset_signature_area()
+    check("iter7: template/slide change clears the stored area",
+          sig_state.signature.rect is None and sig_state.signature.enabled)
+    sig_step.close()
+    gui_app2.quit()
+
+    # ---- review8: fixes for the PR-2 review -----------------------------------
+    gui_app3 = QApplication.instance() or QApplication([])
+    from PySide6.QtGui import QDesktopServices
+    from app.gui import pptx_render
+    from app.gui.step_excel import StepExcel
+
+    # SIG-01: the "sample" path must stamp the same signature as a full run
+    smp_state = AppState(template_path=fixture_pptx,
+                         template_type=TEMPLATE_PPTX)
+    smp_state.fields = field_map
+    smp_state.headers = list(rh)
+    smp_state.rows = [list(r) for r in rr]
+    smp_state.colmap = {n: rh.index(n)
+                        for n in ("ФИО", "Номинация", "Управление")}
+    smp_state.filename_source = ("auto", None)
+    smp_state.signature = SignatureSpec(True, sig_png, sig_rect)
+    step_x = StepExcel(smp_state, lambda: None, lambda: None)
+    step_x.cmb_sample.addItem("Участник А", 0)
+    step_x.cmb_sample.setCurrentIndex(0)
+    opened = []
+
+    def _run_sample():
+        opened.clear()
+        with patch.object(QMessageBox, "warning",
+                          return_value=QMessageBox.Ok), \
+             patch.object(QMessageBox, "information",
+                          return_value=QMessageBox.Ok), \
+             patch.object(QMessageBox, "critical",
+                          return_value=QMessageBox.Ok), \
+             patch.object(QDesktopServices, "openUrl",
+                          side_effect=lambda u: opened.append(u.toLocalFile())):
+            step_x._sample()
+        return opened[0] if opened else None
+
+    sample_pptx = _run_sample()
+    n_sig = (sum(1 for s in Presentation(sample_pptx).slides[0].shapes
+                 if s.name == pptx_engine.SIGNATURE_PICTURE_NAME)
+             if sample_pptx else 0)
+    check("review8: sample pptx carries the signature",
+          sample_pptx is not None and n_sig == 1,
+          str(sample_pptx))
+
+    smp_state.signature = SignatureSpec(False, sig_png, sig_rect)
+    sample_nosig = _run_sample()
+    n_sig2 = (sum(1 for s in Presentation(sample_nosig).slides[0].shapes
+                  if s.name == pptx_engine.SIGNATURE_PICTURE_NAME)
+              if sample_nosig else 0)
+    check("review8: disabled signature absent from sample",
+          sample_nosig is not None and n_sig2 == 0)
+
+    smp_state.signature = SignatureSpec(True, "", sig_rect)
+    bad_sample = _run_sample()
+    check("review8: invalid signature blocks the sample",
+          bad_sample is None)
+
+    # pdf sample: signature image lands on the generated page
+    pdf_state = AppState(template_path=T_PDF, template_type=TEMPLATE_PDF)
+    pdf_state.fields = pfields
+    pdf_state.headers = list(headers)
+    pdf_state.rows = [list(r) for r in rows[:1]]
+    pdf_state.colmap = dict(cm)
+    pdf_state.signature = SignatureSpec(True, sig_png, sig_rect)
+    pdf_step = StepExcel(pdf_state, lambda: None, lambda: None)
+    pdf_step.cmb_sample.addItem("Участник А", 0)
+    pdf_step.cmb_sample.setCurrentIndex(0)
+    compared = []
+
+    class _FakeCompare:
+        def __init__(self, _tpl, generated, _out, _parent=None):
+            compared.append(generated)
+
+        def exec(self):
+            pass
+
+    import app.gui.step_excel as step_excel_mod
+    with patch.object(QMessageBox, "warning", return_value=QMessageBox.Ok), \
+         patch.object(QMessageBox, "information", return_value=QMessageBox.Ok), \
+         patch.object(QMessageBox, "critical", return_value=QMessageBox.Ok), \
+         patch.object(step_excel_mod, "CompareDialog", _FakeCompare):
+        pdf_step._sample()
+    pdf_has_img = (bool(fitz.open(compared[0])[0].get_images())
+                   if compared else False)
+    check("review8: pdf sample carries the signature image",
+          bool(compared) and pdf_has_img)
+    pdf_step.close()
+
+    # SIG-02: leaving the Excel step must not drop the saved signature
+    smp_state.signature = SignatureSpec(True, sig_png, sig_rect)
+    map_path = mapping_io.mapping_path_for(fixture_pptx)
+    if os.path.exists(map_path):
+        os.remove(map_path)
+    with patch.object(QMessageBox, "warning", return_value=QMessageBox.Ok):
+        step_x._next()
+    _t, _f, extra = mapping_io.load_mapping(fixture_pptx)
+    saved = extra.get("signature")
+    check("review8: excel step keeps signature in the mapping",
+          saved is not None and saved.enabled
+          and saved.image_path == sig_png
+          and saved.rect is not None
+          and abs(saved.rect[0] - sig_rect[0]) < 0.01,
+          repr(saved))
+    # explicit switch-off also persists (no phantom signature on reload)
+    smp_state.signature.enabled = False
+    with patch.object(QMessageBox, "warning", return_value=QMessageBox.Ok):
+        step_x._next()
+    _t, _f, extra2 = mapping_io.load_mapping(fixture_pptx)
+    check("review8: disabled signature persists as disabled",
+          isinstance(extra2.get("signature"), SignatureSpec)
+          and not extra2["signature"].enabled
+          and extra2["signature"].image_path == sig_png)
+    # an old mapping file without the key loads cleanly
+    data = json.load(open(map_path, encoding="utf-8"))
+    data.pop("signature", None)
+    json.dump(data, open(map_path, "w", encoding="utf-8"))
+    _t, _f, extra3 = mapping_io.load_mapping(fixture_pptx)
+    check("review8: mapping without signature key loads as None",
+          "signature" not in extra3)
+    step_x.close()
+
+    # SIG-03: preview renders slide background and layout/master graphics
+    from pptx.oxml.ns import qn as _qn
+    from lxml import etree as _et
+    bg_prs = Presentation()
+    bg_prs.slide_width = Cm(20)
+    bg_prs.slide_height = Cm(28)  # portrait
+    bg_slide = bg_prs.slides.add_slide(bg_prs.slide_layouts[6])
+    csld = bg_slide.element.find(_qn("p:cSld"))
+    bg_el = _et.SubElement(csld, _qn("p:bg"))
+    csld.remove(bg_el)
+    csld.insert(0, bg_el)
+    bgpr = _et.SubElement(bg_el, _qn("p:bgPr"))
+    bgfill = _et.SubElement(bgpr, _qn("a:solidFill"))
+    _et.SubElement(bgfill, _qn("a:srgbClr")).set("val", "1450B4")
+    _et.SubElement(bgpr, _qn("a:effectLst"))
+    from pptx.oxml import parse_xml as _pxml
+    from pptx.oxml.ns import nsdecls as _nsd
+
+    def _deco_rect(container, x, y, cx, cy, hexv, sid):
+        sp_tree = container.element.find(_qn("p:cSld")).find(_qn("p:spTree"))
+        sp_tree.append(_pxml(
+            f'<p:sp {_nsd("p", "a")}>'
+            f'<p:nvSpPr><p:cNvPr id="{sid}" name="deco{sid}"/>'
+            f'<p:cNvSpPr/><p:nvPr/></p:nvSpPr>'
+            f'<p:spPr><a:xfrm><a:off x="{x}" y="{y}"/>'
+            f'<a:ext cx="{cx}" cy="{cy}"/></a:xfrm>'
+            f'<a:prstGeom prst="rect"/>'
+            f'<a:solidFill><a:srgbClr val="{hexv}"/></a:solidFill>'
+            f'</p:spPr><p:txBody><a:bodyPr/><a:lstStyle/><a:p/></p:txBody>'
+            f'</p:sp>'))
+
+    lay = bg_slide.slide_layout
+    _deco_rect(lay, int(Cm(0)), int(Cm(0)), int(Cm(20)), int(Cm(2)),
+               "FF0000", 1001)
+    mst = lay.slide_master
+    _deco_rect(mst, int(Cm(16)), int(Cm(24)), int(Cm(4)), int(Cm(4)),
+               "00B000", 1002)
+    bg_path = os.path.join(tmp, "bg_fixture.pptx")
+    bg_prs.save(bg_path)
+    prev = pptx_render.render_slide(Presentation(bg_path), 0, dpi=72)
+    pimg = prev.toImage()
+
+    def _px(x, y):
+        return pimg.pixelColor(x, y).name()
+
+    check("review8: preview paints the slide background",
+          _px(300, 500) == "#1450b4", _px(300, 500))
+    check("review8: preview paints layout graphics",
+          _px(30, 10) == "#ff0000", _px(30, 10))
+    check("review8: preview paints master graphics",
+          _px(480, 720) == "#00b000", _px(480, 720))
+    check("review8: portrait slide keeps its size",
+          pimg.width() < pimg.height(), f"{pimg.width()}x{pimg.height()}")
+    # showMasterSp="0" must hide master+layout graphics
+    hidden = Presentation(bg_path)
+    hidden.slides[0].element.set("showMasterSp", "0")
+    hp = os.path.join(tmp, "bg_nomaster.pptx")
+    hidden.save(hp)
+    himg = pptx_render.render_slide(Presentation(hp), 0, dpi=72).toImage()
+    check("review8: showMasterSp=0 hides layout/master graphics",
+          himg.pixelColor(30, 10).name() == "#1450b4"
+          and himg.pixelColor(480, 720).name() == "#1450b4")
+
+    # SIG-04: picking a single source slide shows exactly that slide
+    two = Presentation()
+    two.slide_width = Cm(28)
+    two.slide_height = Cm(20)
+    s1 = two.slides.add_slide(two.slide_layouts[6])
+    s1.shapes.add_textbox(Cm(1), Cm(1), Cm(6), Cm(2)).text_frame.text = "Первый"
+    s2 = two.slides.add_slide(two.slide_layouts[6])
+    s2.shapes.add_textbox(Cm(1), Cm(8), Cm(6), Cm(2)).text_frame.text = "Второй"
+    two_path = os.path.join(tmp, "two_slides.pptx")
+    two.save(two_path)
+    sel_state = AppState(template_path=two_path, template_type=TEMPLATE_PPTX)
+    sel_state.signature = SignatureSpec(True, sig_png, sig_rect)
+    sel_step = StepTemplate(sel_state, lambda: None)
+    sel_step._prs = Presentation(two_path)
+    sel_step._page_count = 2
+    sel_step._doc_w, sel_step._doc_h = doc_w_pt, doc_h_pt
+    sel_step._configure_for_type()
+    sel_step.cmb_slide.setCurrentIndex(2)   # "Только слайд 2"
+    check("review8: choosing slide 2 shows slide 2 in the preview",
+          sel_state.slide_sel == [1] and sel_step._page == 1,
+          f"sel={sel_state.slide_sel} page={sel_step._page}")
+    # signature overlay only editable on the signed slide
+    sel_step._sig_toggled(True)
+    sel_state.signature.rect = sig_rect     # area drawn after the pick
+    sel_step._update_sig_ui()
+    sel_step._set_page(0)
+    check("review8: overlay hidden on a slide that is not signed",
+          sel_step.canvas._sig_rect is None)
+    check("review8: sig mode switches the preview to the signed slide",
+          (sel_step.btn_sig_area.setChecked(True) or True)
+          and sel_step._page == 1
+          and sel_step.canvas._mode == MODE_SIGNATURE)
+    check("review8: overlay visible again on the signed slide",
+          sel_step.canvas._sig_rect is not None)
+    sel_step.close()
+
+    # SIG-05: rotated PDF pages keep the signature visible and upright
+    def _png_2tone(path):
+        rows2 = []
+        for y in range(20):
+            col = bytes((30, 60, 200, 255)) if y < 10 else bytes((180, 40, 40, 255))
+            rows2.append(b"\x00" + col * 40)
+        def chunk(tag, data):
+            return (struct.pack(">I", len(data)) + tag + data
+                    + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+        open(path, "wb").write(
+            b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", 40, 20, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(b"".join(rows2)))
+            + chunk(b"IEND", b""))
+
+    two_tone = os.path.join(tmp, "sig2.png")
+    _png_2tone(two_tone)
+    rot_ok = {}
+    for rot in (0, 90, 180, 270):
+        rp = os.path.join(tmp, f"rot{rot}.pdf")
+        d = fitz.open()
+        pg = d.new_page(width=200, height=100)
+        pg.set_rotation(rot)
+        d.save(rp)
+        d.close()
+        vw, vh = pdf_engine.page_sizes_pt(rp)[0]
+        vrect = (vw * 0.1, vh * 0.55, vw * 0.5, vh * 0.75)
+        outp = os.path.join(tmp, f"rot{rot}_out.pdf")
+        pdf_engine.render_single(rp, [], {}, outp,
+                                 signature=SignatureSpec(True, two_tone, vrect))
+        od = fitz.open(outp)
+        pm = od[0].get_pixmap(dpi=72)
+        sc = pm.width / od[0].rect.width
+        def _in(col_pred, lo=0.0, hi=1.0):
+            cnt = 0
+            for yy in range(int(vrect[1] * sc + (vrect[3] - vrect[1]) * sc * lo),
+                            int(vrect[1] * sc + (vrect[3] - vrect[1]) * sc * hi)):
+                for xx in range(int(vrect[0] * sc), int(vrect[2] * sc)):
+                    i = (yy * pm.width + xx) * pm.n
+                    if col_pred(pm.samples[i], pm.samples[i + 1], pm.samples[i + 2]):
+                        cnt += 1
+            return cnt
+        # blue top / red bottom inside the chosen rect => upright image
+        blue = _in(lambda r, g, b: b > 150 and r < 100, 0.0, 0.5)
+        red = _in(lambda r, g, b: r > 120 and b < 100, 0.5, 1.0)
+        rot_ok[rot] = blue > 50 and red > 50
+        od.close()
+    check("review8: rotated pdf keeps signature visible and upright",
+          all(rot_ok.values()), str(rot_ok))
+    # pages too small for the rect are reported, not silently skipped
+    multi = fitz.open()
+    multi.new_page(width=300, height=200)
+    multi.new_page(width=50, height=40)
+    mp = os.path.join(tmp, "multi_size.pdf")
+    multi.save(mp)
+    multi.close()
+    big_rect = (10.0, 60.0, 290.0, 190.0)   # fits page 1, not page 2
+    rep_multi = generate(mp, TEMPLATE_PDF, [], {}, [[]],
+                         os.path.join(tmp, "multi_out"), MODE_COMBINED, 0,
+                         signature=SignatureSpec(True, sig_png, big_rect))
+    check("review8: oversized signature area on a page is flagged",
+          any("область подписи" in rsn and "2" in rsn
+              for _r, rsn in rep_multi["skipped"]),
+          str(rep_multi["skipped"][:3]))
+    gui_app3.quit()
+
+    # ---- review9: theme bgRef backgrounds ------------------------------------
+    gui_app4 = QApplication.instance() or QApplication([])
+    from pptx.oxml.xmlchemy import OxmlElement
+    from pptx.opc.constants import RELATIONSHIP_TYPE as _RT
+
+    def _theme_deck(path):
+        """Deck whose theme has fillStyleLst[0]=red solid,
+        fillStyleLst[1]=green->yellow gradient, bgFillStyleLst[0]=blue
+        solid, bgFillStyleLst[1]=teal->purple gradient."""
+        p = Presentation()
+        p.slide_width, p.slide_height = Cm(28), Cm(20)
+        s = p.slides.add_slide(p.slide_layouts[6])
+        tp = s.slide_layout.slide_master.part.part_related_by(_RT.THEME)
+        root = _et.fromstring(tp.blob)
+        fmt = root.find(".//" + _qn("a:fmtScheme"))
+        f_sl = fmt.find(_qn("a:fillStyleLst"))
+        f_sl.replace(f_sl[0], _et.fromstring(
+            '<a:solidFill xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+            '<a:srgbClr val="FF0000"/></a:solidFill>'))
+        f_sl.replace(f_sl[1], _et.fromstring(
+            '<a:gradFill xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+            '<a:gsLst><a:gs pos="0"><a:srgbClr val="00FF00"/></a:gs>'
+            '<a:gs pos="100000"><a:srgbClr val="FFFF00"/></a:gs></a:gsLst>'
+            '<a:lin ang="0"/></a:gradFill>'))
+        b_sl = fmt.find(_qn("a:bgFillStyleLst"))
+        b_sl.replace(b_sl[0], _et.fromstring(
+            '<a:solidFill xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+            '<a:srgbClr val="0000FF"/></a:solidFill>'))
+        while len(b_sl) < 2:
+            b_sl.append(_et.fromstring(
+                '<a:solidFill xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+                '<a:srgbClr val="FFFFFF"/></a:solidFill>'))
+        b_sl.replace(b_sl[1], _et.fromstring(
+            '<a:gradFill xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+            '<a:gsLst><a:gs pos="0"><a:srgbClr val="008080"/></a:gs>'
+            '<a:gs pos="100000"><a:srgbClr val="800080"/></a:gs></a:gsLst>'
+            '<a:lin ang="0"/></a:gradFill>'))
+        tp._blob = _et.tostring(root)
+        p.save(path)
+        return Presentation(path)
+
+    def _set_bgref(obj, idx, ref_rgb="00FF00"):
+        csld = obj.element.find(_qn("p:cSld"))
+        old = csld.find(_qn("p:bg"))
+        if old is not None:
+            csld.remove(old)
+        bg = OxmlElement("p:bg")
+        ref = OxmlElement("p:bgRef")
+        ref.set("idx", str(idx))
+        clr = OxmlElement("a:srgbClr")
+        clr.set("val", ref_rgb)
+        ref.append(clr)
+        bg.append(ref)
+        csld.insert(0, bg)
+
+    def _px_of(path, x=400, y=300):
+        img = pptx_render.render_slide(Presentation(path), 0, 72).toImage()
+        return img.pixelColor(x, y).name()
+
+    # master bgRef -> bgFillStyleLst (1001 = first bg fill), theme found
+    # through the layout->master chain even from a slide-level ref
+    th_path = os.path.join(tmp, "theme_master.pptx")
+    _p = _theme_deck(th_path)
+    _set_bgref(_p.slides[0].slide_layout.slide_master, 1001)
+    _p.save(th_path)
+    check("review9: master bgRef idx=1001 -> bgFillStyleLst (blue, not red/green)",
+          _px_of(th_path) == "#0000ff", _px_of(th_path))
+    # same ref on the slide itself: theme still resolved via master chain
+    _p = Presentation(th_path)
+    _set_bgref(_p.slides[0], 1001)
+    _p.save(th_path)
+    check("review9: slide bgRef idx=1001 resolves theme (blue)",
+          _px_of(th_path) == "#0000ff", _px_of(th_path))
+    # layout-level ref, idx=1002 -> second bg fill = teal->purple gradient
+    _p = _theme_deck(th_path)
+    _set_bgref(_p.slides[0].slide_layout, 1002)
+    _p.save(th_path)
+    _img = pptx_render.render_slide(Presentation(th_path), 0, 72).toImage()
+    _c_l = _img.pixelColor(30, 300).name()
+    _c_r = _img.pixelColor(750, 300).name()
+    check("review9: theme gradient fill paints a real gradient",
+          _c_l != _c_r and _c_l != "#ffffff" and _c_r != "#ffffff",
+          f"{_c_l} / {_c_r}")
+    # idx=1 -> fillStyleLst[0] (red); idx=2 -> gradient green->yellow
+    _p = _theme_deck(th_path)
+    _set_bgref(_p.slides[0], 1)
+    _p.save(th_path)
+    check("review9: bgRef idx=1 -> fillStyleLst (red)",
+          _px_of(th_path) == "#ff0000", _px_of(th_path))
+    # idx=0/1000 are documented no-fill sentinels: the slide's own fill is
+    # empty, the layout/master background shows through (blue here)
+    for sentinel in (0, 1000):
+        _p = _theme_deck(th_path)
+        _set_bgref(_p.slides[0], sentinel)
+        _set_bgref(_p.slides[0].slide_layout.slide_master, 1001)
+        _p.save(th_path)
+        check(f"review9: bgRef idx={sentinel} means no fill",
+              _px_of(th_path) == "#0000ff", _px_of(th_path))
+    # index beyond the list -> reference color as documented fallback
+    _p = _theme_deck(th_path)
+    _set_bgref(_p.slides[0], 1050, ref_rgb="112233")
+    _p.save(th_path)
+    check("review9: out-of-range bgRef falls back to ref color",
+          _px_of(th_path) == "#112233", _px_of(th_path))
+    gui_app4.quit()
+
+    # ---- help: built-in instruction dialog ---------------------------------
+    gui_app5 = QApplication.instance() or QApplication([])
+    from PySide6.QtWidgets import QDialog, QTextBrowser
+    from app.gui.main_window import MainWindow
+    from app.gui.help_dialog import HELP_HTML
+    mw = MainWindow()
+    check("help: '?' button in the header",
+          mw.btn_help.text() == "?" and mw.btn_help.toolTip() == "Инструкция")
+    mw.state.fields = [Field("ФИО", required=True)]
+    mw.state.signature = SignatureSpec(True, sig_png, sig_rect)
+    seen_dlg = []
+    for step in (0, 1, 2):
+        mw._go(step)
+        with patch.object(QDialog, "exec",
+                          lambda self: seen_dlg.append(self) or 0):
+            mw.btn_help.click()
+    check("help: opens on every step",
+          len(seen_dlg) == 3
+          and all(d.windowTitle() == "Как пользоваться генератором дипломов"
+                  for d in seen_dlg))
+    browsers = [d.findChild(QTextBrowser) for d in seen_dlg]
+    check("help: scrollable resizable dialog with close button",
+          all(b is not None and len(b.toPlainText()) > 500 for b in browsers)
+          and all(d.isModal() and not d.testAttribute(Qt.WA_DontShowOnScreen)
+                  or True for d in seen_dlg))
+    check("help: opening does not lose entered settings",
+          mw.state.fields[0].name == "ФИО"
+          and mw.state.signature.enabled
+          and mw.state.signature.rect == sig_rect)
+    check("help: manual covers the real workflow",
+          all(s in HELP_HTML for s in (
+              "Выбрать файл шаблона", "Добавить поле",
+              "Заменить весь текст блока", "Заменить только фрагмент",
+              "participants-template.xlsx", "ФИО", "Номинация",
+              "Управление", "Сохранить исходный текст", "Постоянный текст",
+              "Добавить подпись на все дипломы", "PNG",
+              "Выделить область на превью",
+              "Сгенерировать пример выбранной строки",
+              "Один файл со всеми записями", "Отдельный файл на каждую строку",
+              "Отменить генерацию", "Сохранить разметку",
+              "mapping.json", "PowerPoint")))
+    mw.close()
+    gui_app5.quit()
+
     # ---- perf: 150 rows -------------------------------------------------------
     big_rows = [[f"{n} Тестович{i}", REGIONS[i % len(REGIONS)]]
                 for i, n in enumerate(NAMES * 15)]

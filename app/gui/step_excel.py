@@ -447,6 +447,7 @@ class StepExcel(QWidget):
                 self._filename_col(), set(),
                 first_word=self.state.filename_first_word,
                 slide_sel=self.state.slide_sel,
+                signature=self.state.signature,
             )
         except Exception as exc:
             QMessageBox.critical(self, "Пример", f"Ошибка генерации:\n{exc}")
@@ -484,6 +485,7 @@ class StepExcel(QWidget):
                     filename_source=self.state.filename_source,
                     filename_first_word=self.state.filename_first_word,
                     slide_sel=self.state.slide_sel,
+                    signature=self.state.signature,
                 )
             except Exception:
                 pass

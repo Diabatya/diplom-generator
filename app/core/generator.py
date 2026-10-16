@@ -11,7 +11,8 @@ except ImportError:
     import fitz  # type: ignore
 
 from . import pdf_engine, pptx_engine
-from .models import Field, TEMPLATE_PDF, TEMPLATE_PPTX
+from . import signature as sig
+from .models import Field, SignatureSpec, TEMPLATE_PDF, TEMPLATE_PPTX
 
 MODE_SEPARATE = "separate"
 MODE_COMBINED = "combined"
@@ -219,6 +220,7 @@ def generate(
     exists_mode: str = EXISTS_OVERWRITE,
     first_word: bool = False,
     slide_sel: list[int] | None = None,
+    signature: SignatureSpec | None = None,
     progress_cb=None,
     cancel_cb=None,
 ) -> dict:
@@ -260,6 +262,31 @@ def generate(
             report["skipped"].extend((0, issue) for issue in issues)
             report["report_path"] = _write_report(report, out_dir)
             return report
+    if signature is not None and signature.enabled:
+        try:
+            if template_type == TEMPLATE_PPTX:
+                prs = pptx_engine.open_template(template_path)
+                doc_w = prs.slide_width / 12700.0
+                doc_h = prs.slide_height / 12700.0
+            else:
+                doc_w, doc_h = pdf_engine.page_size_pt(template_path, 0)
+            sig_issues = sig.issues(signature, doc_w, doc_h)
+            if not sig_issues and template_type == TEMPLATE_PDF:
+                bad = [i + 1 for i, (pw, ph) in enumerate(
+                    pdf_engine.page_sizes_pt(template_path))
+                    if sig.fit_box(1, 1,
+                                   sig.clamp_rect(signature.rect, pw, ph))[2] <= 0]
+                if bad:
+                    sig_issues.append(
+                        "область подписи не попадает на страницы: "
+                        + ", ".join(map(str, bad))
+                        + " — уменьшите область или отключите подпись")
+        except Exception as exc:
+            sig_issues = [f"не удалось проверить подпись: {exc}"]
+        if sig_issues:
+            report["skipped"].extend((0, issue) for issue in sig_issues)
+            report["report_path"] = _write_report(report, out_dir)
+            return report
     invalid_rows = {}
     for i, row in enumerate(rows):
         for f in fields:
@@ -283,13 +310,13 @@ def generate(
             _generate_combined(
                 template_path, template_type, fields, colmap, rows,
                 out_dir, skip_rows, empty_rows, invalid_rows, exists_mode, slide_sel,
-                progress, check_cancel, report,
+                signature, progress, check_cancel, report,
             )
         else:
             _generate_separate(
                 template_path, template_type, fields, colmap, rows,
                 out_dir, filename_col, skip_rows, empty_rows, invalid_rows, exists_mode, first_word,
-                slide_sel, progress, check_cancel, report,
+                slide_sel, signature, progress, check_cancel, report,
             )
     except Cancelled:
         report["cancelled"] = True
@@ -330,7 +357,7 @@ def _atomic_save(render_fn, out_path: str, template_type: str):
 def _generate_separate(
     template_path, template_type, fields, colmap, rows, out_dir,
     filename_col, skip_rows, empty_rows, invalid_rows, exists_mode, first_word, slide_sel,
-    progress, check_cancel, report,
+    signature, progress, check_cancel, report,
 ):
     ext = _ext(template_type)
     used = [(i, r) for i, r in enumerate(rows) if i not in skip_rows]
@@ -355,11 +382,13 @@ def _generate_separate(
             if template_type == TEMPLATE_PPTX:
                 notes = _atomic_save(
                     lambda p: engine.render_single(
-                        template_path, fields, values, p, slide_sel=slide_sel),
+                        template_path, fields, values, p, slide_sel=slide_sel,
+                        signature=signature),
                     out_path, template_type)
             else:
                 notes = _atomic_save(
-                    lambda p: engine.render_single(template_path, fields, values, p),
+                    lambda p: engine.render_single(template_path, fields, values, p,
+                                                   signature=signature),
                     out_path, template_type)
             # counted only after the file is really written
             report["created"].append((row_no, fname))
@@ -372,7 +401,7 @@ def _generate_separate(
 
 def _generate_combined(
     template_path, template_type, fields, colmap, rows, out_dir,
-    skip_rows, empty_rows, invalid_rows, exists_mode, slide_sel, progress, check_cancel, report,
+    skip_rows, empty_rows, invalid_rows, exists_mode, slide_sel, signature, progress, check_cancel, report,
 ):
     ext = _ext(template_type)
     stem = _combined_name(template_path, template_type)[: -len(ext)]
@@ -403,7 +432,7 @@ def _generate_combined(
                 template_path, fields, values_list, tmp_path,
                 slide_sel=slide_sel,
                 progress_cb=lambda d: progress(d, f"слайд {d + 1}"),
-                cancel_cb=check_cancel)
+                cancel_cb=check_cancel, signature=signature)
         try:
             notes_per_row = _atomic_save(render, out_path, template_type)
             for (i, _r), notes in zip(used, notes_per_row):
@@ -430,7 +459,8 @@ def _generate_combined(
             progress(done, f"строка {i + 2}")
             values = row_values(fields, colmap, row)
             try:
-                src, notes = pdf_engine.render_pdf_doc(template_path, fields, values)
+                src, notes = pdf_engine.render_pdf_doc(
+                    template_path, fields, values, signature=signature)
                 out_doc.insert_pdf(src)
                 src.close()
                 pending_created.append((i + 2, fname))
