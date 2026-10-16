@@ -191,6 +191,14 @@ def main():
         from PySide6.QtWidgets import QApplication
         app = QApplication.instance() or QApplication(["selftest"])
         _check("Qt platform plugin loads (offscreen)", app is not None)
+        from app.gui.help_dialog import HELP_HTML
+        from app.gui.main_window import MainWindow
+        mw = MainWindow()
+        _check("built-in help available",
+               "Как пользоваться" in HELP_HTML
+               and mw.btn_help.text() == "?"
+               and mw.btn_help.toolTip() == "Инструкция")
+        mw.close()
         app.quit()
     except Exception as e:
         _check("Qt platform plugin loads (offscreen)", False, repr(e))

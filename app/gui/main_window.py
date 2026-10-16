@@ -6,11 +6,12 @@ from __future__ import annotations
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QMainWindow, QStackedWidget,
-    QVBoxLayout, QWidget,
+    QFrame, QHBoxLayout, QLabel, QMainWindow, QPushButton,
+    QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from app import resources
+from app.gui.help_dialog import open_help
 from app.gui.state import AppState
 from app.gui.step_excel import StepExcel
 from app.gui.step_generate import StepGenerate
@@ -54,6 +55,12 @@ class MainWindow(QMainWindow):
         titles.addWidget(self.lbl_title)
         titles.addWidget(self.lbl_breadcrumb)
         hh.addLayout(titles, 1)
+        self.btn_help = QPushButton("?")
+        self.btn_help.setToolTip("Инструкция")
+        self.btn_help.setProperty("secondary", True)
+        self.btn_help.setFixedSize(32, 32)
+        self.btn_help.clicked.connect(lambda: open_help(self))
+        hh.addWidget(self.btn_help)
         v.addWidget(header)
 
         # ---- wizard pages ----------------------------------------------

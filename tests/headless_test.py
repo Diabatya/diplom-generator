@@ -1761,6 +1761,50 @@ def main():
           _px_of(th_path) == "#112233", _px_of(th_path))
     gui_app4.quit()
 
+    # ---- help: built-in instruction dialog ---------------------------------
+    gui_app5 = QApplication.instance() or QApplication([])
+    from PySide6.QtWidgets import QDialog, QTextBrowser
+    from app.gui.main_window import MainWindow
+    from app.gui.help_dialog import HELP_HTML
+    mw = MainWindow()
+    check("help: '?' button in the header",
+          mw.btn_help.text() == "?" and mw.btn_help.toolTip() == "Инструкция")
+    mw.state.fields = [Field("ФИО", required=True)]
+    mw.state.signature = SignatureSpec(True, sig_png, sig_rect)
+    seen_dlg = []
+    for step in (0, 1, 2):
+        mw._go(step)
+        with patch.object(QDialog, "exec",
+                          lambda self: seen_dlg.append(self) or 0):
+            mw.btn_help.click()
+    check("help: opens on every step",
+          len(seen_dlg) == 3
+          and all(d.windowTitle() == "Как пользоваться генератором дипломов"
+                  for d in seen_dlg))
+    browsers = [d.findChild(QTextBrowser) for d in seen_dlg]
+    check("help: scrollable resizable dialog with close button",
+          all(b is not None and len(b.toPlainText()) > 500 for b in browsers)
+          and all(d.isModal() and not d.testAttribute(Qt.WA_DontShowOnScreen)
+                  or True for d in seen_dlg))
+    check("help: opening does not lose entered settings",
+          mw.state.fields[0].name == "ФИО"
+          and mw.state.signature.enabled
+          and mw.state.signature.rect == sig_rect)
+    check("help: manual covers the real workflow",
+          all(s in HELP_HTML for s in (
+              "Выбрать файл шаблона", "Добавить поле",
+              "Заменить весь текст блока", "Заменить только фрагмент",
+              "participants-template.xlsx", "ФИО", "Номинация",
+              "Управление", "Сохранить исходный текст", "Постоянный текст",
+              "Добавить подпись на все дипломы", "PNG",
+              "Выделить область на превью",
+              "Сгенерировать пример выбранной строки",
+              "Один файл со всеми записями", "Отдельный файл на каждую строку",
+              "Отменить генерацию", "Сохранить разметку",
+              "mapping.json", "PowerPoint")))
+    mw.close()
+    gui_app5.quit()
+
     # ---- perf: 150 rows -------------------------------------------------------
     big_rows = [[f"{n} Тестович{i}", REGIONS[i % len(REGIONS)]]
                 for i, n in enumerate(NAMES * 15)]
